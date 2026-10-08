@@ -1,7 +1,7 @@
 fn main() {
-    let target_os = std::env::var("CARGO_CFG_TARGET_OS")
-        .expect("Cargo should set CARGO_CFG_TARGET_OS");
-        
+    let target_os =
+        std::env::var("CARGO_CFG_TARGET_OS").expect("Cargo should set CARGO_CFG_TARGET_OS");
+
     match target_os.as_str() {
         "windows" => {
             println!("cargo:rerun-if-changed=assets/logo.ico");
@@ -15,7 +15,7 @@ fn main() {
             let mut resource = winres::WindowsResource::new();
             resource.set_icon(icon);
             resource.compile().expect("Could not embed icon");
-        }, 
+        }
         &_ => {}
     }
 }
