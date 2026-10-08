@@ -2249,7 +2249,7 @@ fn caption_buttons(ui: &mut Ui, m: &Metrics, pal: &Palette, area: Rect, maximize
                     r,
                     egui::CornerRadius {
                         nw: 0,
-                        ne: RADIUS - 4,
+                        ne: if RADIUS == 0 { RADIUS } else { RADIUS - 4 },
                         sw: 0,
                         se: 0,
                     },
