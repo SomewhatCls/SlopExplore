@@ -3,6 +3,10 @@ name = "SlopExplore"
 version = "0.1.5"
 edition = "2021"
 
+[target.'cfg(windows)'.dependencies]
+window-vibrancy = "0.6"
+winreg = "0.55"
+
 [dependencies]
 eframe = "0.31.1"
 egui_extras = { version = "0.31.1", features = ["svg"] }
@@ -15,13 +19,9 @@ serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 image = { version = "0.25", features = ["ico"] }
 trash = "5.2.9"
-chrono = "0.4"                                               # NEW: real dates in local time
-notify = "8"                                                 # NEW: live refresh + size-cache invalidation
-raw-window-handle = "0.6"                                    # NEW: hands the window to the Mica helper
-
-[target.'cfg(windows)'.dependencies]
-window-vibrancy = "0.6"                                      # NEW: Mica / Mica Alt backdrop
-winreg = "0.55"     
+chrono = "0.4"
+notify = "8"
+raw-window-handle = "0.6"
 
 [build-dependencies]
 winres = "0.1"

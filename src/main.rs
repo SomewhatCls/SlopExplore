@@ -11,8 +11,7 @@ use eframe::{
     egui::{
         self, pos2, vec2, Align, Align2, Color32, CornerRadius, FontId, Id, Layout, Margin, Rect,
         RichText, Sense, Stroke, StrokeKind, Ui,
-    },
-    glow::ZERO,
+    }
 };
 use fsops::*;
 use icons::*;
@@ -5731,8 +5730,11 @@ impl eframe::App for Explorer {
         let rect = ctx.screen_rect();
         let painter = ctx.layer_painter(egui::LayerId::background());
 
-        painter.rect_filled(rect, 8.0, self.pal.layer);
-
+        if self.mica{
+            painter.rect_filled(rect, 8.0, Color32::from_rgba_unmultiplied(120, 120, 120, 10));
+        }else {
+            painter.rect_filled(rect, 8.0, self.pal.layer);
+        }
         let mut actions: Vec<Action> = Vec::new();
         self.collect_shortcuts(ctx, &mut actions);
 
