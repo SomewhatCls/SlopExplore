@@ -227,9 +227,9 @@ impl Palette {
                 control_hover: a(255, 0.13),
                 control_stroke: a(255, 0.0698),
                 divider: a(255, 0.0837),
-                selected: with_alpha(acc, 0.26),
-                selected_hover: with_alpha(acc, 0.34),
-                hover: with_alpha(acc, 0.22),
+                selected: with_alpha(acc, 0.075),
+                selected_hover: with_alpha(acc, 0.09),
+                hover: with_alpha(acc, 0.06),
                 danger: Color32::from_rgb(0xFF, 0x99, 0xA4),
                 danger_bg: Color32::from_rgb(0x44, 0x27, 0x26),
             }
@@ -367,6 +367,7 @@ fn visuals(p: &Palette, m: &Metrics) -> Visuals {
     v.selection.bg_fill = with_alpha(p.accent, 0.40);
     v.selection.stroke = Stroke::new(1.0_f32, p.accent);
     v.hyperlink_color = p.accent;
+    v.override_text_color = Some(p.text);
 
     let w = &mut v.widgets;
     w.noninteractive.bg_fill = Color32::TRANSPARENT;
