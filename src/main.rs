@@ -19,8 +19,9 @@ use indexer::*;
 use serde::{Deserialize, Serialize};
 use std::{
     cmp::Ordering,
-    collections::{HashMap, HashSet},
+    collections::{hash_map::DefaultHasher, HashMap, HashSet, VecDeque},
     fs,
+    hash::{Hash, Hasher},
     path::{Component, Path, PathBuf},
     sync::{
         atomic::{AtomicU64, Ordering as AO},
@@ -138,7 +139,9 @@ struct Tab {
     view: Vec<usize>,
     view_dirty: bool,
     search: String,
-    selected: Option<PathBuf>,
+    selected: HashSet<PathBuf>,
+    /// Last clicked row; start of shift-ranges and origin of keyboard navigation.
+    anchor: Option<PathBuf>,
     error: Option<String>,
     loading: bool,
     load_gen: u64,
@@ -166,7 +169,8 @@ impl Tab {
             view: Vec::new(),
             view_dirty: true,
             search: String::new(),
-            selected: None,
+            selected: HashSet::new(),
+            anchor: None,
             error: None,
             loading: false,
             load_gen: 0,
@@ -179,6 +183,29 @@ impl Tab {
             pending_rename: None,
             trash: None,
         }
+    }
+
+    fn select_only(&mut self, p: PathBuf) {
+        self.selected.clear();
+        self.selected.insert(p.clone());
+        self.anchor = Some(p);
+    }
+
+    fn clear_selection(&mut self) {
+        self.selected.clear();
+        self.anchor = None;
+    }
+
+    /// Selected items that are currently visible, in on-screen order.
+    fn selected_paths(&self) -> Vec<PathBuf> {
+        // `get`, not indexing: right after a listing refresh `view` may briefly be stale.
+        self.view
+            .iter()
+            .filter_map(|&i| self.entries.get(i))
+            .map(|e| &e.path)
+            .filter(|p| self.selected.contains(*p))
+            .cloned()
+            .collect()
     }
 
     fn title(&self) -> String {
@@ -254,10 +281,211 @@ fn save_settings(s: &Settings) {
     }
 }
 
+/// One decided paste operation.
+struct PasteItem {
+    src: PathBuf,
+    dst: PathBuf,
+    /// Remove an existing destination first.
+    replace: bool,
+}
+
+/// A paste that is waiting for the user to decide what to do with each name clash.
 struct PendingPaste {
-    source: PathBuf,
-    destination: PathBuf,
     cut: bool,
+    /// Items that need no decision (or were already decided).
+    ready: Vec<PasteItem>,
+    /// (source, destination) pairs whose destination is already taken; the front one is being asked about.
+    todo: VecDeque<(PathBuf, PathBuf)>,
+    /// "Do this for all remaining conflicts" was ticked.
+    apply_all: bool,
+}
+
+fn occupied(p: &Path) -> bool {
+    fs::symlink_metadata(p).is_ok()
+}
+
+/// "name (n).ext" with the lowest n that is free on disk and not claimed by this paste.
+fn lowest_free_name(dest: &Path, taken: &HashSet<PathBuf>, is_dir: bool) -> PathBuf {
+    let parent = dest.parent().map(Path::to_path_buf).unwrap_or_default();
+    let name = dest
+        .file_name()
+        .map(|n| n.to_string_lossy().into_owned())
+        .unwrap_or_default();
+    let (stem, ext) = if is_dir {
+        (name.clone(), String::new())
+    } else {
+        match name.rfind('.') {
+            Some(i) if i > 0 => (name[..i].to_owned(), name[i..].to_owned()),
+            _ => (name.clone(), String::new()),
+        }
+    };
+    let mut n = 1u32;
+    loop {
+        let cand = parent.join(format!("{stem} ({n}){ext}"));
+        if !occupied(&cand) && !taken.contains(&cand) {
+            return cand;
+        }
+        n += 1;
+    }
+}
+
+// ----------------------------------------------------------------------------------------------
+// Tiling: up to four tabs side by side, built by dragging a tab onto the edge of a pane.
+
+enum Tile {
+    Leaf(u64),
+    Split {
+        /// true: a | b (left/right), false: a over b (top/bottom).
+        side_by_side: bool,
+        ratio: f32,
+        a: Box<Tile>,
+        b: Box<Tile>,
+    },
+}
+
+impl Tile {
+    fn leaf_ids(&self, out: &mut Vec<u64>) {
+        match self {
+            Tile::Leaf(id) => out.push(*id),
+            Tile::Split { a, b, .. } => {
+                a.leaf_ids(out);
+                b.leaf_ids(out);
+            }
+        }
+    }
+
+    fn contains(&self, id: u64) -> bool {
+        let mut v = Vec::new();
+        self.leaf_ids(&mut v);
+        v.contains(&id)
+    }
+
+    fn first_leaf(&self) -> u64 {
+        match self {
+            Tile::Leaf(id) => *id,
+            Tile::Split { a, .. } => a.first_leaf(),
+        }
+    }
+
+    fn map_leaves(&mut self, f: &mut dyn FnMut(u64) -> u64) {
+        match self {
+            Tile::Leaf(id) => *id = f(*id),
+            Tile::Split { a, b, .. } => {
+                a.map_leaves(f);
+                b.map_leaves(f);
+            }
+        }
+    }
+
+    fn replace(&mut self, old: u64, new: u64) {
+        self.map_leaves(&mut |id| if id == old { new } else { id });
+    }
+
+    fn swap(&mut self, x: u64, y: u64) {
+        self.map_leaves(&mut |id| {
+            if id == x {
+                y
+            } else if id == y {
+                x
+            } else {
+                id
+            }
+        });
+    }
+
+    /// Turns the leaf `target` into a split holding `target` and `new`.
+    fn split_leaf(&mut self, target: u64, new: u64, new_first: bool, side_by_side: bool) -> bool {
+        match self {
+            Tile::Leaf(x) => {
+                if *x != target {
+                    return false;
+                }
+                let (a, b) = if new_first {
+                    (new, target)
+                } else {
+                    (target, new)
+                };
+                *self = Tile::Split {
+                    side_by_side,
+                    ratio: 0.5,
+                    a: Box::new(Tile::Leaf(a)),
+                    b: Box::new(Tile::Leaf(b)),
+                };
+                true
+            }
+            Tile::Split { a, b, .. } => {
+                a.split_leaf(target, new, new_first, side_by_side)
+                    || b.split_leaf(target, new, new_first, side_by_side)
+            }
+        }
+    }
+}
+
+/// Removes a leaf; its sibling takes over the freed space.
+fn remove_leaf(t: Tile, id: u64) -> Option<Tile> {
+    match t {
+        Tile::Leaf(x) => {
+            if x == id {
+                None
+            } else {
+                Some(Tile::Leaf(x))
+            }
+        }
+        Tile::Split {
+            side_by_side,
+            ratio,
+            a,
+            b,
+        } => match (remove_leaf(*a, id), remove_leaf(*b, id)) {
+            (Some(a), Some(b)) => Some(Tile::Split {
+                side_by_side,
+                ratio,
+                a: Box::new(a),
+                b: Box::new(b),
+            }),
+            (Some(x), None) | (None, Some(x)) => Some(x),
+            (None, None) => None,
+        },
+    }
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum DropZone {
+    Center,
+    Left,
+    Right,
+    Top,
+    Bottom,
+}
+
+fn drop_zone(r: Rect, p: egui::Pos2, can_split: bool) -> DropZone {
+    if !can_split || r.width() < 1.0 || r.height() < 1.0 {
+        return DropZone::Center;
+    }
+    let (u, v) = ((p.x - r.left()) / r.width(), (p.y - r.top()) / r.height());
+    let (dl, dr, dt, db) = (u, 1.0 - u, v, 1.0 - v);
+    let near = dl.min(dr).min(dt).min(db);
+    if near > 0.28 {
+        DropZone::Center
+    } else if near == dl {
+        DropZone::Left
+    } else if near == dr {
+        DropZone::Right
+    } else if near == dt {
+        DropZone::Top
+    } else {
+        DropZone::Bottom
+    }
+}
+
+fn zone_rect(r: Rect, z: DropZone) -> Rect {
+    match z {
+        DropZone::Center => r,
+        DropZone::Left => Rect::from_min_max(r.min, pos2(r.center().x, r.bottom())),
+        DropZone::Right => Rect::from_min_max(pos2(r.center().x, r.top()), r.max),
+        DropZone::Top => Rect::from_min_max(r.min, pos2(r.right(), r.center().y)),
+        DropZone::Bottom => Rect::from_min_max(pos2(r.left(), r.center().y), r.max),
+    }
 }
 
 struct Props {
@@ -296,6 +524,7 @@ enum Action {
     NewTabAt(PathBuf),
     NewTab,
     CloseTab(usize),
+    ClosePane(u64),
     SwitchTab(usize),
     StepTab(i32),
     Back,
@@ -306,14 +535,14 @@ enum Action {
     FocusAddress,
     FocusSearch,
     Open(PathBuf),
-    Copy(PathBuf),
-    Cut(PathBuf),
-    CopyPath(PathBuf),
+    Copy(Vec<PathBuf>),
+    Cut(Vec<PathBuf>),
+    CopyPath(Vec<PathBuf>),
     Paste,
     Rename(PathBuf),
     CommitRename(PathBuf, String),
     CancelRename,
-    Delete(PathBuf),
+    Delete(Vec<PathBuf>),
     NewFolder,
     Properties(PathBuf),
     OpenContaining(PathBuf),
@@ -328,6 +557,7 @@ enum Action {
     TrashPurgeSelected,
     TrashEmpty,
     TrashSelectAll,
+    SelectAll,
 }
 
 #[derive(Default)]
@@ -525,7 +755,7 @@ struct Explorer {
     last_drives: Instant,
     drives_inflight: bool,
     quick: Vec<(&'static str, &'static str, PathBuf)>,
-    clipboard: Option<(PathBuf, bool)>,
+    clipboard: Option<(Vec<PathBuf>, bool)>,
     peazip: Option<PathBuf>,
 
     msg_tx: Sender<AppMsg>,
@@ -560,6 +790,14 @@ struct Explorer {
     font_edit: Option<f32>,
     confirm: Option<ConfirmPurge>,
     sidebar_rect: Option<Rect>,
+
+    /// None: the normal single-tab view. Some: up to four tabs tiled in the file area.
+    tiles: Option<Tile>,
+    /// Tab (by id) currently being dragged out of the tab strip.
+    tab_drag: Option<u64>,
+    /// What the folder-size indexer was last started for; avoids restarting an identical scan.
+    index_sig: Option<(u64, usize)>,
+    reindex_force: bool,
 }
 
 impl Explorer {
@@ -648,6 +886,10 @@ impl Explorer {
             font_edit: None,
             confirm: None,
             sidebar_rect: None,
+            tiles: None,
+            tab_drag: None,
+            index_sig: None,
+            reindex_force: false,
         };
         app.load_tab(0);
         app.on_active_changed();
@@ -683,7 +925,7 @@ impl Explorer {
             tab.fwd.clear();
             tab.trash = Some(TrashState::new());
             tab.search.clear();
-            tab.selected = None;
+            tab.clear_selection();
             tab.rename = None;
             tab.editing_addr = false;
             tab.view_dirty = true;
@@ -747,12 +989,27 @@ impl Explorer {
             }
         };
         let tab = &mut self.tabs[ti];
+        let in_trash = tab.trash.is_some();
         if path == tab.dir {
-            tab.address = path.display().to_string();
+            if in_trash {
+                // The Recycle Bin is a view *over* `tab.dir`, so asking for that same folder
+                // (e.g. Home right after opening the bin from Home) must leave the bin instead of
+                // being ignored. open_trash() already pushed `dir` onto the back stack; undo that.
+                if tab.back.last() == Some(&path) {
+                    tab.back.pop();
+                }
+                tab.fwd.clear();
+                self.set_dir(ti, path);
+            } else {
+                tab.address = path.display().to_string();
+            }
             return;
         }
-        let prev = tab.dir.clone();
-        tab.back.push(prev);
+        if !in_trash {
+            // (in the bin, open_trash() has already recorded the folder we came from)
+            let prev = tab.dir.clone();
+            tab.back.push(prev);
+        }
         tab.fwd.clear();
         self.set_dir(ti, path);
     }
@@ -762,7 +1019,7 @@ impl Explorer {
         tab.address = path.display().to_string();
         tab.dir = path;
         tab.search.clear();
-        tab.selected = None;
+        tab.clear_selection();
         tab.rename = None;
         tab.editing_addr = false;
         tab.trash = None;
@@ -781,28 +1038,173 @@ impl Explorer {
         if let Some(w) = &mut self.watcher {
             w.watch(&dir);
         }
-        self.start_indexing();
+        self.start_indexing(false);
     }
 
-    fn start_indexing(&mut self) {
-        let tab = &mut self.tabs[self.active];
-        let mut paths = Vec::new();
-        for e in tab.entries.iter_mut().filter(|e| e.is_dir && !e.is_link) {
-            if e.dir_size.is_none() {
-                e.dir_size = self.indexer.lookup(&e.path);
+    /// Indices of the tabs currently on screen (all tiled tabs, or just the active one).
+    fn visible_tabs(&self) -> Vec<usize> {
+        if let Some(t) = &self.tiles {
+            let mut ids = Vec::new();
+            t.leaf_ids(&mut ids);
+            let v: Vec<usize> = ids
+                .iter()
+                .filter_map(|id| self.tabs.iter().position(|x| x.id == *id))
+                .collect();
+            if !v.is_empty() {
+                return v;
             }
-            paths.push(e.path.clone());
         }
+        vec![self.active]
+    }
+
+    /// Starts the folder-size scan for every visible tab. A scan for exactly the same set of
+    /// folders is not restarted unless `force` is set (restarting throws away the work already done).
+    fn start_indexing(&mut self, force: bool) {
+        let mut paths = Vec::new();
+        let mut acc = 0u64;
+        for ti in self.visible_tabs() {
+            let tab = &mut self.tabs[ti];
+            let mut h = DefaultHasher::new();
+            tab.id.hash(&mut h);
+            tab.dir.hash(&mut h);
+            acc ^= h.finish();
+            for e in tab.entries.iter_mut().filter(|e| e.is_dir && !e.is_link) {
+                if e.dir_size.is_none() {
+                    e.dir_size = self.indexer.lookup(&e.path);
+                }
+                let mut h = DefaultHasher::new();
+                e.path.hash(&mut h);
+                acc ^= h.finish().rotate_left(13);
+                paths.push(e.path.clone());
+            }
+        }
+        let sig = (acc, paths.len());
+        if !force && self.index_sig == Some(sig) {
+            return;
+        }
+        self.index_sig = Some(sig);
         self.indexer.start(paths); // also cancels a scan that belonged to the previous folder
     }
 
     fn new_tab(&mut self, dir: PathBuf) {
         let id = self.next_tab_id;
         self.next_tab_id += 1;
+        if let Some(tree) = self.tiles.as_mut() {
+            // In tiled mode the new tab takes over the focused pane.
+            let cur = self.tabs[self.active].id;
+            tree.replace(cur, id);
+        }
         self.tabs.push(Tab::new(id, dir));
         self.active = self.tabs.len() - 1;
         self.load_tab(self.active);
         self.on_active_changed();
+    }
+
+    /// Makes tab `i` the focused one. In tiled mode a tab that is not on screen replaces the focused pane.
+    fn activate_tab(&mut self, i: usize) {
+        if i >= self.tabs.len() {
+            return;
+        }
+        let new_id = self.tabs[i].id;
+        let mut shown = false;
+        if let Some(tree) = self.tiles.as_mut() {
+            if !tree.contains(new_id) {
+                let cur = self.tabs[self.active].id;
+                tree.replace(cur, new_id);
+                shown = true;
+            }
+        }
+        if i != self.active || shown {
+            self.active = i;
+            self.on_active_changed();
+            if shown {
+                self.load_tab(i);
+            }
+        }
+    }
+
+    /// Keeps the tile tree consistent: drops panes whose tab is gone, turns a lone pane back into the
+    /// normal view, and makes sure the focused tab is one of the visible ones.
+    fn fix_tiles(&mut self) {
+        let Some(tree) = self.tiles.take() else {
+            return;
+        };
+        let mut ids = Vec::new();
+        tree.leaf_ids(&mut ids);
+        let mut tree = Some(tree);
+        for id in ids {
+            if !self.tabs.iter().any(|t| t.id == id) {
+                tree = tree.and_then(|t| remove_leaf(t, id));
+            }
+        }
+        let Some(tree) = tree else {
+            return;
+        };
+        if let Tile::Leaf(id) = &tree {
+            if let Some(i) = self.tabs.iter().position(|t| t.id == *id) {
+                if i != self.active {
+                    self.active = i;
+                    self.on_active_changed();
+                }
+            }
+            return; // a single pane is just the normal view
+        }
+        let active_id = self.tabs[self.active].id;
+        let first = tree.first_leaf();
+        let has_active = tree.contains(active_id);
+        self.tiles = Some(tree);
+        if !has_active {
+            if let Some(i) = self.tabs.iter().position(|t| t.id == first) {
+                self.active = i;
+                self.on_active_changed();
+            }
+        }
+    }
+
+    /// A tab was dropped on a pane: on its edge it splits the pane, in the middle it takes the pane's place.
+    fn drop_tab(&mut self, dragged: u64, target: u64, zone: DropZone) {
+        let Some(di) = self.tabs.iter().position(|t| t.id == dragged) else {
+            return;
+        };
+        let mut tree = self.tiles.take().unwrap_or(Tile::Leaf(target));
+        if dragged != target {
+            if zone == DropZone::Center {
+                if tree.contains(dragged) {
+                    tree.swap(dragged, target);
+                } else {
+                    tree.replace(target, dragged);
+                }
+            } else {
+                let mut ids = Vec::new();
+                tree.leaf_ids(&mut ids);
+                let already = ids.contains(&dragged);
+                if already || ids.len() < 4 {
+                    let base = if already {
+                        remove_leaf(tree, dragged)
+                    } else {
+                        Some(tree)
+                    };
+                    let Some(mut base) = base else {
+                        return;
+                    };
+                    let (new_first, side_by_side) = match zone {
+                        DropZone::Left => (true, true),
+                        DropZone::Right => (false, true),
+                        DropZone::Top => (true, false),
+                        _ => (false, false),
+                    };
+                    base.split_leaf(target, dragged, new_first, side_by_side);
+                    tree = base;
+                }
+            }
+        }
+        self.tiles = Some(tree);
+        if di != self.active {
+            self.active = di;
+            self.on_active_changed();
+        }
+        self.load_tab(di);
+        self.fix_tiles();
     }
 
     fn open_path(&mut self, path: &Path) {
@@ -828,54 +1230,107 @@ impl Explorer {
         self.job_label = label.to_owned();
         let (tx, ctx) = (self.msg_tx.clone(), self.ctx.clone());
         std::thread::spawn(move || {
-            let _ = tx.send(AppMsg::Job(f()));
+            // A panic in the job must still report back, otherwise the status bar spins forever.
+            let r = std::panic::catch_unwind(std::panic::AssertUnwindSafe(f)).unwrap_or_else(|_| {
+                Err("The operation failed unexpectedly (details in crash.log).".to_owned())
+            });
+            let _ = tx.send(AppMsg::Job(r));
             ctx.request_repaint();
         });
     }
 
-    fn finish_paste(&mut self, source: PathBuf, dest: PathBuf, cut: bool, replace: bool) {
+    /// Runs the decided paste items as one background job.
+    fn run_paste(&mut self, items: Vec<PasteItem>, cut: bool) {
+        if items.is_empty() {
+            return;
+        }
         if cut {
             self.clipboard = None;
         }
         self.run_job(if cut { "Moving…" } else { "Copying…" }, move || {
-            if replace && dest.exists() {
-                remove_existing(&dest)
-                    .map_err(|e| format!("Could not replace the existing item: {e}"))?;
+            let mut errors: Vec<String> = Vec::new();
+            for it in items {
+                let name = it
+                    .dst
+                    .file_name()
+                    .map(|n| n.to_string_lossy().into_owned())
+                    .unwrap_or_default();
+                if it.replace && occupied(&it.dst) {
+                    if let Err(e) = remove_existing(&it.dst) {
+                        errors.push(format!("Could not replace “{name}”: {e}"));
+                        continue;
+                    }
+                }
+                let r = if cut {
+                    move_item(&it.src, &it.dst)
+                } else {
+                    copy_item(&it.src, &it.dst)
+                };
+                if let Err(e) = r {
+                    errors.push(format!("Could not paste “{name}”: {e}"));
+                }
             }
-            let r = if cut {
-                move_item(&source, &dest)
+            if errors.is_empty() {
+                Ok(String::new())
             } else {
-                copy_item(&source, &dest)
-            };
-            r.map(|_| String::new())
-                .map_err(|e| format!("Could not paste item: {e}"))
+                let more = errors.len().saturating_sub(2);
+                let mut text = errors.into_iter().take(2).collect::<Vec<_>>().join("  |  ");
+                if more > 0 {
+                    text.push_str(&format!("  (+{more} more)"));
+                }
+                Err(text)
+            }
         });
     }
 
     fn paste(&mut self) {
-        let Some((source, cut)) = self.clipboard.clone() else {
+        if self.conflict.is_some() {
+            return; // a question is already on screen
+        }
+        let Some((sources, cut)) = self.clipboard.clone() else {
             return;
         };
         let dir = self.tabs[self.active].dir.clone();
-        let Some(name) = source.file_name() else {
-            self.tabs[self.active].error = Some("Could not determine the item's name.".into());
-            return;
-        };
-        let mut dest = dir.join(name);
-        if source == dest {
-            if cut {
-                return;
+        let mut ready: Vec<PasteItem> = Vec::new();
+        let mut todo: VecDeque<(PathBuf, PathBuf)> = VecDeque::new();
+        let mut claimed: HashSet<PathBuf> = HashSet::new();
+        for source in sources {
+            let Some(name) = source.file_name() else {
+                continue;
+            };
+            let dest = dir.join(name);
+            if cut && source == dest {
+                continue; // moving an item onto itself is a no-op
             }
-            dest = unique_copy_name(&dest); // copy + paste in the same folder -> "name (1)"
+            if source.is_dir() && dir.starts_with(&source) {
+                self.tabs[self.active].error = Some(format!(
+                    "Can't {} “{}” into itself or one of its subfolders.",
+                    if cut { "move" } else { "copy" },
+                    name.to_string_lossy()
+                ));
+                continue;
+            }
+            // Same-folder copies land here too (source == dest): they are asked about like any other clash.
+            if occupied(&dest) || claimed.contains(&dest) {
+                todo.push_back((source, dest));
+            } else {
+                claimed.insert(dest.clone());
+                ready.push(PasteItem {
+                    src: source,
+                    dst: dest,
+                    replace: false,
+                });
+            }
         }
-        if dest.exists() {
-            self.conflict = Some(PendingPaste {
-                source,
-                destination: dest,
-                cut,
-            });
+        if todo.is_empty() {
+            self.run_paste(ready, cut);
         } else {
-            self.finish_paste(source, dest, cut, false);
+            self.conflict = Some(PendingPaste {
+                cut,
+                ready,
+                todo,
+                apply_all: false,
+            });
         }
     }
 
@@ -892,6 +1347,7 @@ impl Explorer {
     fn pump_messages(&mut self) {
         let active_id = self.tabs[self.active].id;
         let mut reindex = false;
+        let mut reindex_force = false;
 
         while let Ok(msg) = self.msg_rx.try_recv() {
             match msg {
@@ -922,14 +1378,18 @@ impl Explorer {
                                             path: p.clone(),
                                             focus_pending: true,
                                         });
-                                        t.selected = Some(p);
+                                        t.select_only(p);
                                     }
                                 }
-                                if let Some(sel) = &t.selected {
-                                    if !t.lookup.contains_key(sel) {
-                                        t.selected = None;
-                                    }
+                                let lookup = &t.lookup;
+                                t.selected.retain(|p| lookup.contains_key(p));
+                                if t.anchor.as_ref().is_some_and(|a| !lookup.contains_key(a)) {
+                                    t.anchor = None;
                                 }
+                                // `view` holds indices into `entries`; they are stale as soon as the
+                                // list changes. Rebuild now, before anything else touches them
+                                // (deleting a file used to leave an out-of-range index behind).
+                                rebuild_view(t);
                             }
                             Err(e) => {
                                 t.entries.clear();
@@ -953,7 +1413,8 @@ impl Explorer {
                                 match result {
                                     Ok(rows) => {
                                         tr.rows = rows;
-                                        t.view_dirty = true;
+                                        rebuild_trash_view(tr, &t.search);
+                                        t.view_dirty = false;
                                     }
                                     Err(e) => {
                                         tr.rows.clear();
@@ -981,10 +1442,13 @@ impl Explorer {
                             None => self.tabs[active].error = Some(e),
                         }
                     }
-                    if self.tabs[active].trash.is_some() {
-                        self.load_trash(active);
-                    } else {
-                        self.load_tab(active);
+                    // Refresh every pane on screen: a paste may have landed in a neighbouring pane.
+                    for ti in self.visible_tabs() {
+                        if self.tabs[ti].trash.is_some() {
+                            self.load_trash(ti);
+                        } else {
+                            self.load_tab(ti);
+                        }
                     }
                 }
                 AppMsg::Stats(seq, stats) => {
@@ -1040,15 +1504,22 @@ impl Explorer {
             .ready(Duration::from_millis(1500), Duration::from_secs(10))
         {
             reindex = true;
+            reindex_force = true; // something below the folder changed: sizes really are stale
         }
         if self.list_debounce.pending() || self.size_debounce.pending() {
             self.ctx.request_repaint_after(Duration::from_millis(250));
         }
         if reindex {
-            self.start_indexing();
+            let force = reindex_force || std::mem::take(&mut self.reindex_force);
+            self.start_indexing(force);
         }
 
-        if self.last_drives.elapsed() > Duration::from_secs(15) && !self.drives_inflight {
+        // Probing every volume can block for seconds on a disconnected network drive or an empty
+        // card reader, so do it rarely and only while the window is in use.
+        if self.last_drives.elapsed() > Duration::from_secs(30)
+            && !self.drives_inflight
+            && self.ctx.input(|i| i.focused)
+        {
             self.refresh_drives();
         }
         if self.indexer.is_dirty() {
@@ -1064,7 +1535,7 @@ impl Explorer {
     // ------------------------------------------------------------------ system integration
 
     fn sync_system(&mut self, ctx: &egui::Context, frame: &eframe::Frame) {
-        if self.last_poll.elapsed() > Duration::from_secs(2) {
+        if self.last_poll.elapsed() > Duration::from_secs(2) && ctx.input(|i| i.focused) {
             self.last_poll = Instant::now();
             self.text_scale = system_text_scale();
             self.sys_accent = system_accent();
@@ -1106,7 +1577,11 @@ impl Explorer {
             || self.confirm.is_some();
         let tab = &self.tabs[self.active];
         let in_trash = tab.trash.is_some();
-        let sel = if in_trash { None } else { tab.selected.clone() };
+        let sel: Vec<PathBuf> = if in_trash {
+            Vec::new()
+        } else {
+            tab.selected_paths()
+        };
         let active = self.active;
 
         ctx.input_mut(|i| {
@@ -1161,27 +1636,37 @@ impl Explorer {
                     actions.push(Action::TrashSelectAll);
                 }
             }
+            if !in_trash && i.consume_key(M::CTRL, Key::A) {
+                actions.push(Action::SelectAll);
+            }
             let ev_copy = i.events.iter().any(|e| matches!(e, egui::Event::Copy));
             let ev_cut = i.events.iter().any(|e| matches!(e, egui::Event::Cut));
             let ev_paste = i.events.iter().any(|e| matches!(e, egui::Event::Paste(_)));
-            if let Some(p) = &sel {
+            if !sel.is_empty() {
                 if ev_copy || (i.modifiers.command && i.key_pressed(Key::C)) {
-                    actions.push(Action::Copy(p.clone()));
+                    actions.push(Action::Copy(sel.clone()));
                 }
                 if ev_cut || (i.modifiers.command && i.key_pressed(Key::X)) {
-                    actions.push(Action::Cut(p.clone()));
+                    actions.push(Action::Cut(sel.clone()));
                 }
                 if i.consume_key(M::NONE, Key::Enter) {
-                    actions.push(Action::Open(p.clone()));
+                    if sel.len() == 1 {
+                        actions.push(Action::Open(sel[0].clone()));
+                    } else {
+                        // With several items selected, Enter opens the files (not the folders).
+                        for p in sel.iter().filter(|p| !p.is_dir()).take(20) {
+                            actions.push(Action::Open(p.clone()));
+                        }
+                    }
                 }
-                if i.consume_key(M::NONE, Key::F2) {
-                    actions.push(Action::Rename(p.clone()));
+                if sel.len() == 1 && i.consume_key(M::NONE, Key::F2) {
+                    actions.push(Action::Rename(sel[0].clone()));
                 }
                 if i.consume_key(M::NONE, Key::Delete) {
-                    actions.push(Action::Delete(p.clone()));
+                    actions.push(Action::Delete(sel.clone()));
                 }
                 if i.consume_key(M::ALT, Key::Enter) {
-                    actions.push(Action::Properties(p.clone()));
+                    actions.push(Action::Properties(sel[0].clone()));
                 }
             }
             if ev_paste || (i.modifiers.command && i.key_pressed(Key::V)) {
@@ -1234,25 +1719,31 @@ impl Explorer {
                 if self.tabs.len() <= 1 {
                     self.ctx.send_viewport_cmd(egui::ViewportCommand::Close);
                 } else if i < self.tabs.len() {
+                    let closed_id = self.tabs[i].id;
                     self.tabs.remove(i);
                     if self.active >= self.tabs.len() {
                         self.active = self.tabs.len() - 1;
                     } else if i < self.active {
                         self.active -= 1;
                     }
+                    if let Some(t) = self.tiles.take() {
+                        self.tiles = remove_leaf(t, closed_id);
+                    }
                     self.on_active_changed();
+                    self.fix_tiles();
                 }
             }
-            Action::SwitchTab(i) => {
-                if i < self.tabs.len() && i != self.active {
-                    self.active = i;
-                    self.on_active_changed();
+            Action::ClosePane(id) => {
+                if let Some(t) = self.tiles.take() {
+                    self.tiles = remove_leaf(t, id);
                 }
+                self.fix_tiles();
             }
+            Action::SwitchTab(i) => self.activate_tab(i),
             Action::StepTab(d) => {
                 let n = self.tabs.len() as i32;
-                self.active = (self.active as i32 + d).rem_euclid(n) as usize;
-                self.on_active_changed();
+                let next = (self.active as i32 + d).rem_euclid(n) as usize;
+                self.activate_tab(next);
             }
             Action::Back => {
                 let tab = &mut self.tabs[ti];
@@ -1279,6 +1770,7 @@ impl Explorer {
                 if self.tabs[ti].trash.is_some() {
                     self.load_trash(ti);
                 } else {
+                    self.reindex_force = true; // F5 also recalculates folder sizes
                     self.load_tab(ti);
                 }
             }
@@ -1298,9 +1790,24 @@ impl Explorer {
                 .ctx
                 .memory_mut(|m| m.request_focus(Id::new("search_box"))),
             Action::Open(p) => self.open_path(&p),
-            Action::Copy(p) => self.clipboard = Some((p, false)),
-            Action::Cut(p) => self.clipboard = Some((p, true)),
-            Action::CopyPath(p) => self.ctx.copy_text(p.display().to_string()),
+            Action::Copy(p) => {
+                if !p.is_empty() {
+                    self.clipboard = Some((p, false));
+                }
+            }
+            Action::Cut(p) => {
+                if !p.is_empty() {
+                    self.clipboard = Some((p, true));
+                }
+            }
+            Action::CopyPath(p) => {
+                let text = p
+                    .iter()
+                    .map(|x| x.display().to_string())
+                    .collect::<Vec<_>>()
+                    .join("\n");
+                self.ctx.copy_text(text);
+            }
             Action::Paste => self.paste(),
             Action::Rename(p) => {
                 let tab = &mut self.tabs[ti];
@@ -1311,7 +1818,7 @@ impl Explorer {
                         path: p.clone(),
                         focus_pending: true,
                     });
-                    tab.selected = Some(p);
+                    tab.select_only(p);
                     tab.scroll_to = tab.view.iter().position(|&v| v == i);
                 }
             }
@@ -1337,15 +1844,18 @@ impl Explorer {
                 match fs::rename(&p, &dest) {
                     Ok(()) => {
                         self.indexer.invalidate(&p);
-                        self.tabs[ti].selected = Some(dest);
+                        self.tabs[ti].select_only(dest);
                         self.load_tab(ti);
                     }
                     Err(e) => self.tabs[ti].error = Some(format!("Could not rename item: {e}")),
                 }
             }
             Action::Delete(p) => {
+                if p.is_empty() {
+                    return;
+                }
                 self.run_job("Moving to Recycle Bin…", move || {
-                    trash::delete(&p)
+                    trash::delete_all(&p)
                         .map(|_| String::new())
                         .map_err(|e| format!("Could not move item to the Recycle Bin: {e}"))
                 });
@@ -1384,7 +1894,7 @@ impl Explorer {
             Action::OpenContaining(p) => {
                 if let Some(parent) = p.parent().map(Path::to_path_buf) {
                     self.navigate(ti, parent);
-                    self.tabs[ti].selected = Some(p);
+                    self.tabs[ti].select_only(p);
                 }
             }
             Action::PeaOpen(p) => {
@@ -1446,6 +1956,17 @@ impl Explorer {
                     tr.selected = tr.view.iter().copied().collect();
                 }
             }
+            Action::SelectAll => {
+                let tab = &mut self.tabs[ti];
+                if tab.trash.is_some() {
+                    return;
+                }
+                tab.selected = tab
+                    .view
+                    .iter()
+                    .map(|&i| tab.entries[i].path.clone())
+                    .collect();
+            }
             Action::MoveSelection(delta) => {
                 let tab = &mut self.tabs[ti];
                 if let Some(tr) = tab.trash.as_mut() {
@@ -1456,7 +1977,7 @@ impl Explorer {
                     return;
                 }
                 let cur = tab
-                    .selected
+                    .anchor
                     .as_ref()
                     .and_then(|s| tab.lookup.get(s))
                     .and_then(|&i| tab.view.iter().position(|&v| v == i));
@@ -1464,7 +1985,8 @@ impl Explorer {
                     Some(c) => (c as i32 + delta).clamp(0, tab.view.len() as i32 - 1) as usize,
                     None => 0,
                 };
-                tab.selected = Some(tab.entries[tab.view[next]].path.clone());
+                let path = tab.entries[tab.view[next]].path.clone();
+                tab.select_only(path);
                 tab.scroll_to = Some(next);
             }
             Action::SelectEdge(last) => {
@@ -1477,7 +1999,8 @@ impl Explorer {
                     return;
                 }
                 let i = if last { tab.view.len() - 1 } else { 0 };
-                tab.selected = Some(tab.entries[tab.view[i]].path.clone());
+                let path = tab.entries[tab.view[i]].path.clone();
+                tab.select_only(path);
                 tab.scroll_to = Some(i);
             }
         }
@@ -2632,19 +3155,50 @@ fn trash_table_ui(
     ui.spacing_mut().item_spacing.y = 0.0;
     egui::ScrollArea::vertical()
         .id_salt("trash_rows")
+        .drag_to_scroll(false) // dragging selects instead
         .auto_shrink([false, false])
         .show_rows(ui, row_h, view.len(), |ui, range| {
+            let content_top = ui.max_rect().top() - range.start as f32 * row_h;
+            let band_hit = ui.clip_rect();
+            let band = rubber_band(
+                ui,
+                m,
+                Id::new("trash_rubber"),
+                content_top,
+                row_h,
+                view.len(),
+                true,
+                band_hit,
+            );
+            if let Some(u) = &band {
+                let base_id = Id::new("trash_rubber_base");
+                if u.started {
+                    let base: Vec<usize> = if u.additive {
+                        selected.iter().copied().collect()
+                    } else {
+                        Vec::new()
+                    };
+                    ui.ctx().data_mut(|d| d.insert_temp(base_id, base));
+                }
+                let base: Vec<usize> = ui.ctx().data(|d| d.get_temp(base_id)).unwrap_or_default();
+                selected.clear();
+                selected.extend(base);
+                if let Some((lo, hi)) = u.span {
+                    for vi in lo..=hi {
+                        selected.insert(view[vi]);
+                    }
+                }
+                if let Some(end) = u.end {
+                    *anchor = Some(end);
+                }
+            }
             for vi in range.clone() {
                 let ri = view[vi];
                 let row = &rows[ri];
                 let (rect, resp) = ui.allocate_exact_size(vec2(avail, row_h), Sense::click());
                 let is_sel = selected.contains(&ri);
                 let bg = if is_sel {
-                    if resp.hovered() {
-                        pal.selected_hover
-                    } else {
-                        pal.selected
-                    }
+                    sel_fill(pal, resp.hovered())
                 } else if resp.hovered() {
                     pal.subtle_hover
                 } else {
@@ -2656,6 +3210,9 @@ fn trash_table_ui(
                         CornerRadius::same(m.radius),
                         bg,
                     );
+                }
+                if is_sel {
+                    paint_sel_marker(ui, rect, m, pal);
                 }
                 draw_icon(
                     ui,
@@ -2740,6 +3297,9 @@ fn trash_table_ui(
                     }
                 });
             }
+            if let Some(u) = &band {
+                paint_band(ui, pal, u.rect);
+            }
             if let Some(vi) = scroll_to.take() {
                 let top = ui.max_rect().top() - range.start as f32 * row_h;
                 let target = Rect::from_min_size(
@@ -2752,6 +3312,164 @@ fn trash_table_ui(
 }
 
 // ==============================================================================================
+// Selection visuals + drag (rubber-band) selection
+
+/// Fill for a selected row. Deliberately stronger than the generic accent wash used elsewhere.
+fn sel_fill(pal: &Palette, hovered: bool) -> Color32 {
+    let base = if hovered {
+        pal.selected_hover
+    } else {
+        pal.selected
+    };
+    base.gamma_multiply(1.55)
+}
+
+/// Fluent-style accent indicator on the left edge of a selected row.
+fn paint_sel_marker(ui: &Ui, rect: Rect, m: &Metrics, pal: &Palette) {
+    let marker = Rect::from_center_size(
+        pos2(rect.left() + m.s * 4.0, rect.center().y),
+        vec2(m.s * 3.0, rect.height() * 0.5),
+    );
+    ui.painter()
+        .rect_filled(marker, CornerRadius::same(2), pal.accent);
+}
+
+#[derive(Clone, Default)]
+struct Rubber {
+    /// Where the button went down (screen space) - used for the drag threshold.
+    press: egui::Pos2,
+    /// x in screen space, y in *content* space, so the band stays anchored while the list scrolls.
+    origin: egui::Pos2,
+    active: bool,
+    additive: bool,
+}
+
+struct BandUpdate {
+    /// First frame of this drag: the caller should snapshot the selection it wants to keep.
+    started: bool,
+    /// Ctrl/Shift was held on press: keep the old selection and add to it.
+    additive: bool,
+    /// Inclusive range of list rows touched by the band.
+    span: Option<(usize, usize)>,
+    /// Row under the pointer (becomes the keyboard anchor).
+    end: Option<usize>,
+    /// Band rectangle in screen space, clipped to the list viewport.
+    rect: Rect,
+}
+
+/// Drag-to-select for a virtualised, fixed-row-height list. Call it from inside the `show_rows`
+/// closure (before drawing the rows) with the y of the first row of the whole list.
+fn rubber_band(
+    ui: &mut Ui,
+    m: &Metrics,
+    id: Id,
+    content_top: f32,
+    row_h: f32,
+    rows: usize,
+    enabled: bool,
+    hit: Rect,
+) -> Option<BandUpdate> {
+    let ctx = ui.ctx().clone();
+    let viewport = ui.clip_rect();
+    let (pressed, down, pos, latest, dt, mods) = ui.input(|i| {
+        (
+            i.pointer.primary_pressed(),
+            i.pointer.primary_down(),
+            i.pointer.interact_pos(),
+            i.pointer.latest_pos(),
+            i.stable_dt,
+            i.modifiers,
+        )
+    });
+    let mut state: Option<Rubber> = ctx.data_mut(|d| d.get_temp(id));
+
+    if pressed && enabled && state.is_none() {
+        if let Some(p) = pos {
+            let on_scrollbar = viewport.contains(p) && p.x > viewport.right() - m.s * 14.0;
+            // layer_id_at() is None over plain panels and Some(..) over dialogs/menus/popups.
+            let covered = ctx.layer_id_at(p).is_some_and(|l| l != ui.layer_id());
+            // `hit` is the viewport plus the blank margins around it: a drag may start there too.
+            if hit.contains(p) && !on_scrollbar && !covered {
+                state = Some(Rubber {
+                    press: p,
+                    origin: pos2(p.x, p.y - content_top),
+                    active: false,
+                    additive: mods.command || mods.shift,
+                });
+            }
+        }
+    }
+    let mut r = state?;
+    if !down {
+        ctx.data_mut(|d| d.remove_temp::<Rubber>(id));
+        return None;
+    }
+    let Some(p) = latest else {
+        ctx.data_mut(|d| d.insert_temp(id, r));
+        return None;
+    };
+
+    // Stay clear of egui's own click threshold (6 px) so a drag never also counts as a click.
+    let mut started = false;
+    if !r.active && (p - r.press).length() > 7.0 {
+        r.active = true;
+        started = true;
+    }
+    let mut out = None;
+    if r.active {
+        ctx.request_repaint();
+
+        // Auto-scroll while the pointer is above/below the list.
+        let dy = if p.y > viewport.bottom() {
+            p.y - viewport.bottom()
+        } else if p.y < viewport.top() {
+            p.y - viewport.top()
+        } else {
+            0.0
+        };
+        if dy != 0.0 {
+            ui.scroll_with_delta(vec2(0.0, -dy.clamp(-80.0, 80.0) * 10.0 * dt));
+        }
+
+        let cur_y = p.y - content_top;
+        let (y0, y1) = (r.origin.y.min(cur_y), r.origin.y.max(cur_y));
+        let span = if rows == 0 || y1 < 0.0 || y0 >= rows as f32 * row_h {
+            None
+        } else {
+            let lo = (y0.max(0.0) / row_h).floor() as usize;
+            let hi = ((y1 / row_h).floor() as usize).min(rows - 1);
+            Some((lo.min(rows - 1), hi))
+        };
+        let end = if rows == 0 {
+            None
+        } else {
+            Some(((cur_y / row_h).floor().max(0.0) as usize).min(rows - 1))
+        };
+        let origin_screen = pos2(r.origin.x, r.origin.y + content_top);
+        out = Some(BandUpdate {
+            started,
+            additive: r.additive,
+            span,
+            end,
+            rect: Rect::from_two_pos(origin_screen, p).intersect(viewport),
+        });
+    }
+    ctx.data_mut(|d| d.insert_temp(id, r));
+    out
+}
+
+fn paint_band(ui: &Ui, pal: &Palette, rect: Rect) {
+    ui.painter()
+        .rect_filled(rect, CornerRadius::same(2), pal.accent.gamma_multiply(0.18));
+    ui.painter().rect_stroke(
+        rect,
+        CornerRadius::same(2),
+        Stroke::new(1.0_f32, pal.accent),
+        StrokeKind::Inside,
+    );
+}
+
+// ==============================================================================================
 // The file table
 
 #[allow(clippy::too_many_arguments)]
@@ -2761,9 +3479,10 @@ fn table_ui(
     pal: &Palette,
     tab: &mut Tab,
     cols: &mut [f32; 3],
-    cut_path: Option<&Path>,
+    cut: Option<&HashSet<PathBuf>>,
     can_paste: bool,
     has_peazip: bool,
+    hit: Rect,
     actions: &mut Vec<Action>,
 ) {
     let Tab {
@@ -2772,6 +3491,7 @@ fn table_ui(
         entries,
         view,
         selected,
+        anchor,
         rename,
         scroll_to,
         sort_col,
@@ -2941,10 +3661,15 @@ fn table_ui(
     );
 
     // ---- body
+    ui.add_space(m.pad * 0.3);
     let body_rect = ui.available_rect_before_wrap();
-    let body_resp = ui.interact(body_rect, Id::new(("body", tab_id)), Sense::click());
+    // The click/drag area reaches into the blank side margins, so a selection drag (or a click that
+    // clears the selection) can start next to the rows instead of having to hit a row exactly.
+    let band_hit = Rect::from_min_max(pos2(hit.left(), body_rect.top()), hit.max);
+    let body_resp = ui.interact(band_hit, Id::new(("body", tab_id)), Sense::click());
     if body_resp.clicked() {
-        *selected = None;
+        selected.clear();
+        *anchor = None;
     }
     body_resp.context_menu(|ui| {
         if menu_item(
@@ -3004,18 +3729,52 @@ fn table_ui(
     ui.spacing_mut().item_spacing.y = 0.0;
     egui::ScrollArea::vertical()
         .id_salt(("rows", tab_id, dir.clone()))
+        .drag_to_scroll(false) // dragging selects instead
         .auto_shrink([false, false])
-        .show_rows(ui, row_h, view.len(), |ui, range| {
+        // two extra blank rows below the list: always some empty space to start a drag in
+        .show_rows(ui, row_h, view.len() + 2, |ui, range| {
+            let content_top = ui.max_rect().top() - range.start as f32 * row_h;
+            let band = rubber_band(
+                ui,
+                m,
+                Id::new(("rubber", tab_id)),
+                content_top,
+                row_h,
+                view.len(),
+                rename.is_none(),
+                band_hit,
+            );
+            if let Some(u) = &band {
+                let base_id = Id::new(("rubber_base", tab_id));
+                if u.started {
+                    let base: Vec<PathBuf> = if u.additive {
+                        selected.iter().cloned().collect()
+                    } else {
+                        Vec::new()
+                    };
+                    ui.ctx().data_mut(|d| d.insert_temp(base_id, base));
+                }
+                let base: Vec<PathBuf> = ui.ctx().data(|d| d.get_temp(base_id)).unwrap_or_default();
+                selected.clear();
+                selected.extend(base);
+                if let Some((lo, hi)) = u.span {
+                    for vi in lo..=hi {
+                        selected.insert(entries[view[vi]].path.clone());
+                    }
+                }
+                if let Some(end) = u.end {
+                    *anchor = Some(entries[view[end]].path.clone());
+                }
+            }
             for vi in range.clone() {
+                if vi >= view.len() {
+                    break; // the blank rows
+                }
                 let e = &entries[view[vi]];
                 let (rect, resp) = ui.allocate_exact_size(vec2(avail, row_h), Sense::click());
-                let is_sel = selected.as_deref() == Some(e.path.as_path());
+                let is_sel = selected.contains(&e.path);
                 let bg = if is_sel {
-                    if resp.hovered() {
-                        pal.selected_hover
-                    } else {
-                        pal.selected
-                    }
+                    sel_fill(pal, resp.hovered())
                 } else if resp.hovered() {
                     pal.subtle_hover
                 } else {
@@ -3028,7 +3787,10 @@ fn table_ui(
                         bg,
                     );
                 }
-                let dim = cut_path == Some(e.path.as_path());
+                if is_sel {
+                    paint_sel_marker(ui, rect, m, pal);
+                }
+                let dim = cut.is_some_and(|c| c.contains(&e.path));
                 let tint = if dim {
                     Color32::from_white_alpha(110)
                 } else {
@@ -3127,7 +3889,30 @@ fn table_ui(
                 }
 
                 if (resp.clicked() || resp.secondary_clicked()) && !renaming_here {
-                    *selected = Some(e.path.clone());
+                    let mods = ui.input(|i| i.modifiers);
+                    if resp.clicked() && mods.command {
+                        // Ctrl-click toggles one item.
+                        if !selected.remove(&e.path) {
+                            selected.insert(e.path.clone());
+                        }
+                        *anchor = Some(e.path.clone());
+                    } else if resp.clicked() && mods.shift && anchor.is_some() {
+                        // Shift-click selects the range from the anchor to this row.
+                        let from = anchor
+                            .as_ref()
+                            .and_then(|a| view.iter().position(|&v| &entries[v].path == a))
+                            .unwrap_or(vi);
+                        let (lo, hi) = (from.min(vi), from.max(vi));
+                        selected.clear();
+                        for pos in lo..=hi {
+                            selected.insert(entries[view[pos]].path.clone());
+                        }
+                    } else if !(resp.secondary_clicked() && is_sel) {
+                        // Right-clicking inside the selection keeps it, so the menu acts on all of it.
+                        selected.clear();
+                        selected.insert(e.path.clone());
+                        *anchor = Some(e.path.clone());
+                    }
                 }
                 if resp.double_clicked() && !renaming_here {
                     actions.push(Action::Open(e.path.clone()));
@@ -3138,6 +3923,16 @@ fn table_ui(
 
                 resp.context_menu(|ui| {
                     let p = &e.path;
+                    // Menu actions apply to the whole selection when the clicked row is part of it.
+                    let targets: Vec<PathBuf> = if selected.contains(&e.path) {
+                        view.iter()
+                            .map(|&i| &entries[i].path)
+                            .filter(|q| selected.contains(*q))
+                            .cloned()
+                            .collect()
+                    } else {
+                        vec![e.path.clone()]
+                    };
                     if menu_item(ui, m, pal, Some("external"), "Open", Some("Enter"), true) {
                         actions.push(Action::Open(p.clone()));
                         ui.close_menu();
@@ -3150,23 +3945,31 @@ fn table_ui(
                     }
                     ui.separator();
                     if menu_item(ui, m, pal, Some("cut"), "Cut", Some("Ctrl+X"), true) {
-                        actions.push(Action::Cut(p.clone()));
+                        actions.push(Action::Cut(targets.clone()));
                         ui.close_menu();
                     }
                     if menu_item(ui, m, pal, Some("copy"), "Copy", Some("Ctrl+C"), true) {
-                        actions.push(Action::Copy(p.clone()));
+                        actions.push(Action::Copy(targets.clone()));
                         ui.close_menu();
                     }
                     if menu_item(ui, m, pal, Some("link"), "Copy path", None, true) {
-                        actions.push(Action::CopyPath(p.clone()));
+                        actions.push(Action::CopyPath(targets.clone()));
                         ui.close_menu();
                     }
-                    if menu_item(ui, m, pal, Some("rename"), "Rename", Some("F2"), true) {
+                    if menu_item(
+                        ui,
+                        m,
+                        pal,
+                        Some("rename"),
+                        "Rename",
+                        Some("F2"),
+                        targets.len() == 1,
+                    ) {
                         actions.push(Action::Rename(p.clone()));
                         ui.close_menu();
                     }
                     if menu_item(ui, m, pal, Some("delete"), "Delete", Some("Del"), true) {
-                        actions.push(Action::Delete(p.clone()));
+                        actions.push(Action::Delete(targets.clone()));
                         ui.close_menu();
                     }
                     if has_peazip {
@@ -3216,6 +4019,10 @@ fn table_ui(
                 });
             }
 
+            if let Some(u) = &band {
+                paint_band(ui, pal, u.rect);
+            }
+
             // Keyboard navigation: bring the selected row into view even if it isn't rendered yet.
             if let Some(vi) = scroll_to.take() {
                 let top = ui.max_rect().top() - range.start as f32 * row_h;
@@ -3232,6 +4039,144 @@ fn table_ui(
 // Panels
 //8px window decoration radius for linux
 const RADIUS: u8 = if cfg!(target_os = "linux") { 12 } else { 0 };
+
+/// The contents of one pane: the file table (or the Recycle Bin) of `tab`, inside `rect`.
+#[allow(clippy::too_many_arguments)]
+fn tab_body(
+    ui: &mut Ui,
+    rect: Rect,
+    m: &Metrics,
+    pal: &Palette,
+    tab: &mut Tab,
+    cols: &mut [f32; 3],
+    cut: Option<&HashSet<PathBuf>>,
+    can_paste: bool,
+    has_peazip: bool,
+    actions: &mut Vec<Action>,
+) {
+    let tab_id = tab.id;
+    if tab.trash.is_some() {
+        let Tab {
+            trash,
+            search,
+            view_dirty,
+            ..
+        } = tab;
+        let tr = trash.as_mut().unwrap();
+        if *view_dirty || tr.needs_sort {
+            rebuild_trash_view(tr, search);
+            *view_dirty = false;
+        }
+        let searching = !search.trim().is_empty();
+        let inner = rect.shrink2(vec2(m.pad * 0.5, 0.0));
+        ui.scope_builder(
+            egui::UiBuilder::new()
+                .id_salt(("tab_body", tab_id))
+                .max_rect(inner),
+            |ui| {
+                trash_table_ui(ui, m, pal, tr, searching, actions);
+            },
+        );
+        return;
+    }
+    if tab.view_dirty {
+        rebuild_view(tab);
+    }
+    // A little breathing room left and right of the list.
+    let gutter = m.pad;
+    let inner = Rect::from_min_max(
+        pos2(rect.left() + gutter, rect.top()),
+        pos2(rect.right() - gutter, rect.bottom()),
+    );
+    ui.scope_builder(
+        egui::UiBuilder::new()
+            .id_salt(("tab_body", tab_id))
+            .max_rect(inner),
+        |ui| {
+            table_ui(
+                ui, m, pal, tab, cols, cut, can_paste, has_peazip, rect, actions,
+            );
+        },
+    );
+}
+
+/// Lays the tile tree out inside `rect`, handling the draggable dividers on the way.
+/// Collects (tab id, pane rectangle) for every leaf.
+fn layout_tiles(
+    ui: &mut Ui,
+    t: &mut Tile,
+    rect: Rect,
+    m: &Metrics,
+    pal: &Palette,
+    out: &mut Vec<(u64, Rect)>,
+) {
+    match t {
+        Tile::Leaf(id) => out.push((*id, rect)),
+        Tile::Split {
+            side_by_side,
+            ratio,
+            a,
+            b,
+        } => {
+            let gap = m.s * 5.0;
+            let span = (if *side_by_side {
+                rect.width()
+            } else {
+                rect.height()
+            } - gap)
+                .max(1.0);
+            let split = (span * *ratio).round();
+            let (ra, rb, handle) = if *side_by_side {
+                let x = rect.left() + split;
+                (
+                    Rect::from_min_max(rect.min, pos2(x, rect.bottom())),
+                    Rect::from_min_max(pos2(x + gap, rect.top()), rect.max),
+                    Rect::from_min_max(pos2(x, rect.top()), pos2(x + gap, rect.bottom())),
+                )
+            } else {
+                let y = rect.top() + split;
+                (
+                    Rect::from_min_max(rect.min, pos2(rect.right(), y)),
+                    Rect::from_min_max(pos2(rect.left(), y + gap), rect.max),
+                    Rect::from_min_max(pos2(rect.left(), y), pos2(rect.right(), y + gap)),
+                )
+            };
+            let id = Id::new(("tile_divider", a.first_leaf(), b.first_leaf()));
+            let resp = ui.interact(handle, id, Sense::drag());
+            let hot = resp.hovered() || resp.dragged();
+            if hot {
+                ui.ctx().set_cursor_icon(if *side_by_side {
+                    egui::CursorIcon::ResizeHorizontal
+                } else {
+                    egui::CursorIcon::ResizeVertical
+                });
+            }
+            if resp.dragged() {
+                let d = if *side_by_side {
+                    resp.drag_delta().x
+                } else {
+                    resp.drag_delta().y
+                };
+                *ratio = (*ratio + d / span).clamp(0.15, 0.85);
+            }
+            let c = handle.center();
+            let line = if *side_by_side {
+                [pos2(c.x, handle.top()), pos2(c.x, handle.bottom())]
+            } else {
+                [pos2(handle.left(), c.y), pos2(handle.right(), c.y)]
+            };
+            ui.painter().line_segment(
+                line,
+                Stroke::new(
+                    if hot { 2.0_f32 } else { 1.0_f32 },
+                    if hot { pal.accent } else { pal.divider },
+                ),
+            );
+            layout_tiles(ui, a, ra, m, pal, out);
+            layout_tiles(ui, b, rb, m, pal, out);
+        }
+    }
+}
 
 impl Explorer {
     /// The title bar: tabs on the left, draggable empty space, caption buttons on the right.
@@ -3253,6 +4198,15 @@ impl Explorer {
             })
             .collect();
         let maximized = ctx.input(|i| i.viewport().maximized.unwrap_or(false));
+        // Tabs that are currently shown in a tile get a thin accent underline.
+        let vis: Vec<u64> = {
+            let mut v = Vec::new();
+            if let Some(t) = &self.tiles {
+                t.leaf_ids(&mut v);
+            }
+            v
+        };
+        let mut drag_start: Option<u64> = None;
         let bar_h = m.tab_h + m.s * 6.0;
         let caption_w = m.s * 46.0 * 3.0;
         let r_tab = m.radius + 2;
@@ -3301,9 +4255,12 @@ impl Explorer {
                         let avail = ui.available_width() - m.ctl_h - m.pad * 0.5;
                         let tab_w = (avail / n as f32).clamp(m.s * 90.0, m.s * 240.0);
                         for (i, (id, title, full_path, tab_icon)) in info.iter().enumerate() {
-                            let (rect, resp) =
-                                ui.allocate_exact_size(vec2(tab_w, m.tab_h), Sense::click());
+                            let (rect, resp) = ui
+                                .allocate_exact_size(vec2(tab_w, m.tab_h), Sense::click_and_drag());
                             let is_active = i == active;
+                            if resp.drag_started_by(egui::PointerButton::Primary) {
+                                drag_start = Some(*id);
+                            }
                             let k = ctx.animate_bool_with_time(
                                 Id::new(("tab_wing", *id)),
                                 is_active,
@@ -3334,6 +4291,16 @@ impl Explorer {
                                     rect.shrink2(vec2(0.0, m.s * 3.0)),
                                     CornerRadius::same(m.radius),
                                     c,
+                                );
+                            }
+                            if !is_active && vis.contains(id) {
+                                ui.painter().rect_filled(
+                                    Rect::from_min_size(
+                                        pos2(rect.left() + m.pad, rect.bottom() - m.s * 4.0),
+                                        vec2(rect.width() - m.pad * 2.0, m.s * 2.0),
+                                    ),
+                                    CornerRadius::same(1),
+                                    pal.accent.gamma_multiply(0.75),
                                 );
                             }
                             let close_sz = m.small_icon * 2.0;
@@ -3423,6 +4390,9 @@ impl Explorer {
 
                 caption_buttons(ui, &m, &pal, caption, maximized);
             });
+        if let Some(id) = drag_start {
+            self.tab_drag = Some(id);
+        }
     }
 
     fn ui_sidebar(&mut self, ctx: &egui::Context, actions: &mut Vec<Action>) {
@@ -3558,7 +4528,7 @@ impl Explorer {
             Some(t) => (true, t.selected.len(), !t.rows.is_empty()),
             None => (false, 0, false),
         };
-        let sel = self.tabs[self.active].selected.clone();
+        let sel = self.tabs[self.active].selected_paths();
         let (can_paste, hidden, settings_open) = (
             self.clipboard.is_some(),
             self.settings.show_hidden,
@@ -3655,13 +4625,13 @@ impl Explorer {
                         actions.push(Action::NewFolder);
                     }
                     vsep(ui, &m, &pal);
-                    if let Some(p) = &sel {
+                    if !sel.is_empty() {
                         if icon_button(ui, &m, &pal, "cut", "Cut (Ctrl+X)", true, false).clicked() {
-                            actions.push(Action::Cut(p.clone()));
+                            actions.push(Action::Cut(sel.clone()));
                         }
                         if icon_button(ui, &m, &pal, "copy", "Copy (Ctrl+C)", true, false).clicked()
                         {
-                            actions.push(Action::Copy(p.clone()));
+                            actions.push(Action::Copy(sel.clone()));
                         }
                     } else {
                         icon_button(ui, &m, &pal, "cut", "Cut (Ctrl+X)", false, false);
@@ -3672,15 +4642,16 @@ impl Explorer {
                     {
                         actions.push(Action::Paste);
                     }
-                    if let Some(p) = &sel {
-                        if icon_button(ui, &m, &pal, "rename", "Rename (F2)", true, false).clicked()
+                    if !sel.is_empty() {
+                        if icon_button(ui, &m, &pal, "rename", "Rename (F2)", sel.len() == 1, false)
+                            .clicked()
                         {
-                            actions.push(Action::Rename(p.clone()));
+                            actions.push(Action::Rename(sel[0].clone()));
                         }
                         if icon_button(ui, &m, &pal, "delete", "Delete (Del)", true, false)
                             .clicked()
                         {
-                            actions.push(Action::Delete(p.clone()));
+                            actions.push(Action::Delete(sel.clone()));
                         }
                     } else {
                         icon_button(ui, &m, &pal, "rename", "Rename (F2)", false, false);
@@ -3731,12 +4702,25 @@ impl Explorer {
             if !tr.selected.is_empty() {
                 text.push_str(&format!("   |   {} selected", tr.selected.len()));
             }
-        } else if let Some(sel) = &tab.selected {
-            if let Some(&i) = tab.lookup.get(sel) {
-                let e = &tab.entries[i];
-                text.push_str("   |   1 item selected");
-                if let Some(s) = if e.is_dir { e.dir_size } else { Some(e.size) } {
-                    text.push_str(&format!("   {}", format_size(s)));
+        } else if !tab.selected.is_empty() {
+            let (mut count, mut bytes, mut all_known) = (0usize, 0u64, true);
+            for p in &tab.selected {
+                if let Some(&i) = tab.lookup.get(p) {
+                    let e = &tab.entries[i];
+                    count += 1;
+                    match if e.is_dir { e.dir_size } else { Some(e.size) } {
+                        Some(s) => bytes = bytes.saturating_add(s),
+                        None => all_known = false,
+                    }
+                }
+            }
+            if count > 0 {
+                text.push_str(&format!(
+                    "   |   {count} item{} selected",
+                    if count == 1 { "" } else { "s" }
+                ));
+                if all_known {
+                    text.push_str(&format!("   {}", format_size(bytes)));
                 }
             }
         }
@@ -3744,13 +4728,14 @@ impl Explorer {
             self.jobs_running > 0 || tab.loading || tab.trash.as_ref().is_some_and(|t| t.loading);
         let job = self.job_label.clone();
         let clip = self.clipboard.as_ref().map(|(p, cut)| {
-            format!(
-                "{}: {}",
-                if *cut { "Cut" } else { "Copied" },
-                p.file_name()
+            let what = if p.len() == 1 {
+                p[0].file_name()
                     .map(|n| n.to_string_lossy().into_owned())
                     .unwrap_or_default()
-            )
+            } else {
+                format!("{} items", p.len())
+            };
+            format!("{}: {}", if *cut { "Cut" } else { "Copied" }, what)
         });
         egui::TopBottomPanel::bottom("status")
             .show_separator_line(false)
@@ -3800,66 +4785,226 @@ impl Explorer {
     }
 
     fn ui_central(&mut self, ctx: &egui::Context, actions: &mut Vec<Action>) {
+        self.fix_tiles();
         let (m, pal) = (self.m, self.pal);
         let can_paste = self.clipboard.is_some();
         let has_peazip = self.peazip.is_some();
-        let cut_path = self.clipboard.as_ref().filter(|c| c.1).map(|c| c.0.clone());
-        let cols = &mut self.settings.col_widths;
-        let tab = &mut self.tabs[self.active];
-        if tab.trash.is_some() {
-            let Tab {
-                trash,
-                search,
-                view_dirty,
-                ..
-            } = tab;
-            let tr = trash.as_mut().unwrap();
-            if *view_dirty || tr.needs_sort {
-                rebuild_trash_view(tr, search);
-                *view_dirty = false;
-            }
-            let searching = !search.trim().is_empty();
-            egui::CentralPanel::default()
-                .frame(layer_frame(
-                    &pal,
-                    m.radius,
-                    m.pad * 0.5,
-                    0.0,
-                    0.0,
-                    0.0,
-                    false,
-                ))
-                .show(ctx, |ui| {
-                    trash_table_ui(ui, &m, &pal, tr, searching, actions);
+        let cut_set: Option<HashSet<PathBuf>> = self
+            .clipboard
+            .as_ref()
+            .filter(|c| c.1)
+            .map(|c| c.0.iter().cloned().collect());
+        let active = self.active;
+        let mut panes: Vec<(u64, Rect)> = Vec::new();
+        let mut focus: Option<usize> = None;
+        let mut tree = self.tiles.take();
+        let frame = layer_frame(&pal, m.radius, 0.0, 0.0, 0.0, 0.0, false);
+
+        match tree.as_mut() {
+            None => {
+                let cols = &mut self.settings.col_widths;
+                let tab = &mut self.tabs[active];
+                let tab_id = tab.id;
+                egui::CentralPanel::default().frame(frame).show(ctx, |ui| {
+                    let rect = ui.max_rect();
+                    panes.push((tab_id, rect));
+                    tab_body(
+                        ui,
+                        rect,
+                        &m,
+                        &pal,
+                        tab,
+                        cols,
+                        cut_set.as_ref(),
+                        can_paste,
+                        has_peazip,
+                        actions,
+                    );
                 });
+            }
+            Some(t) => {
+                let tabs = &mut self.tabs;
+                let cols = &mut self.settings.col_widths;
+                egui::CentralPanel::default().frame(frame).show(ctx, |ui| {
+                    let full = ui.max_rect();
+                    let mut rects: Vec<(u64, Rect)> = Vec::new();
+                    layout_tiles(ui, t, full, &m, &pal, &mut rects);
+                    let press = ctx.input(|i| {
+                        if i.pointer.any_pressed() {
+                            i.pointer.interact_pos()
+                        } else {
+                            None
+                        }
+                    });
+                    let hdr_h = m.row_h;
+                    for (tid, rect) in rects {
+                        let Some(idx) = tabs.iter().position(|x| x.id == tid) else {
+                            continue;
+                        };
+                        panes.push((tid, rect));
+                        let is_active = idx == active;
+                        // Clicking anywhere in a pane focuses it (but not through a menu or dialog on top of it).
+                        if let Some(p) = press {
+                            let covered = ctx.layer_id_at(p).is_some_and(|l| l != ui.layer_id());
+                            if !is_active && !covered && rect.contains(p) {
+                                focus = Some(idx);
+                            }
+                        }
+                        let hdr = Rect::from_min_max(rect.min, pos2(rect.right(), rect.top() + hdr_h));
+                        let body = Rect::from_min_max(pos2(rect.left(), hdr.bottom()), rect.max);
+
+                        // Pane title strip: folder name, and a button that closes just this pane.
+                        ui.painter()
+                            .rect_filled(hdr, CornerRadius::ZERO, pal.subtle_pressed);
+                        if is_active {
+                            ui.painter().rect_filled(
+                                Rect::from_min_size(hdr.min, vec2(hdr.width(), m.s * 2.0)),
+                                CornerRadius::ZERO,
+                                pal.accent,
+                            );
+                        }
+                        let in_bin = tabs[idx].trash.is_some();
+                        draw_icon(
+                            ui,
+                            pos2(hdr.left() + m.pad + m.small_icon / 2.0, hdr.center().y),
+                            m.small_icon,
+                            if in_bin { "recycle_bin" } else { "folder" },
+                            Color32::WHITE,
+                        );
+                        let close_rect = Rect::from_center_size(
+                            pos2(hdr.right() - m.pad - m.small_icon / 2.0, hdr.center().y),
+                            vec2(m.ctl_h * 0.8, m.ctl_h * 0.8),
+                        );
+                        let title_rect = Rect::from_min_max(
+                            pos2(hdr.left() + m.pad * 1.7 + m.small_icon, hdr.top()),
+                            pos2(close_rect.left() - m.pad * 0.3, hdr.bottom()),
+                        );
+                        paint_text(
+                            ui,
+                            title_rect,
+                            &tabs[idx].title(),
+                            FontId::proportional(m.font * 0.93),
+                            if is_active {
+                                pal.text
+                            } else {
+                                pal.text_secondary
+                            },
+                            false,
+                        );
+                        let cr = ui.interact(close_rect, Id::new(("pane_close", tid)), Sense::click());
+                        hover_fill(ui, close_rect, &cr, &pal, &m);
+                        draw_icon(ui, close_rect.center(), m.small_icon * 0.8, "close", pal.text_secondary);
+                        cr.clone().on_hover_text("Close this pane");
+                        if cr.clicked() {
+                            actions.push(Action::ClosePane(tid));
+                        }
+
+                        let tab = &mut tabs[idx];
+                        ui.scope_builder(
+                            egui::UiBuilder::new()
+                                .id_salt(("pane", tid))
+                                .max_rect(body),
+                            |ui| {
+                                ui.set_clip_rect(body.intersect(ui.clip_rect()));
+                                tab_body(
+                                    ui,
+                                    body,
+                                    &m,
+                                    &pal,
+                                    tab,
+                                    cols,
+                                    cut_set.as_ref(),
+                                    can_paste,
+                                    has_peazip,
+                                    actions,
+                                );
+                            },
+                        );
+                    }
+                });
+            }
+        }
+        self.tiles = tree;
+
+        if let Some(i) = focus {
+            if i != self.active && i < self.tabs.len() {
+                self.active = i;
+                self.on_active_changed();
+                self.load_tab(i); // the pane may have been out of date: only the focused folder is watched
+            }
+        }
+        self.tab_drag_overlay(ctx, &panes);
+    }
+
+    /// While a tab is being dragged: previews where it would land and performs the drop on release.
+    fn tab_drag_overlay(&mut self, ctx: &egui::Context, panes: &[(u64, Rect)]) {
+        let Some(dragged) = self.tab_drag else {
             return;
+        };
+        let (pos, down, released) = ctx.input(|i| {
+            (
+                i.pointer.latest_pos(),
+                i.pointer.primary_down(),
+                i.pointer.primary_released(),
+            )
+        });
+        let (m, pal) = (self.m, self.pal);
+        ctx.set_cursor_icon(egui::CursorIcon::Grabbing);
+        ctx.request_repaint();
+        let mut target: Option<(u64, DropZone)> = None;
+        if let Some(p) = pos {
+            let already = panes.iter().any(|(t, _)| *t == dragged);
+            let can_split = already || panes.len() < 4;
+            if let Some((tid, rect)) = panes.iter().find(|(_, r)| r.contains(p)) {
+                if *tid != dragged {
+                    let zone = drop_zone(*rect, p, can_split);
+                    target = Some((*tid, zone));
+                    let painter = ctx.layer_painter(egui::LayerId::new(
+                        egui::Order::Foreground,
+                        Id::new("tile_drop_preview"),
+                    ));
+                    let zr = zone_rect(*rect, zone).shrink(m.s * 3.0);
+                    painter.rect_filled(
+                        zr,
+                        CornerRadius::same(m.radius),
+                        pal.accent.gamma_multiply(0.22),
+                    );
+                    painter.rect_stroke(
+                        zr,
+                        CornerRadius::same(m.radius),
+                        Stroke::new(2.0_f32, pal.accent),
+                        StrokeKind::Inside,
+                    );
+                }
+            }
+            // A small label follows the pointer.
+            let title = self
+                .tabs
+                .iter()
+                .find(|t| t.id == dragged)
+                .map(|t| t.title())
+                .unwrap_or_default();
+            let tip = ctx.layer_painter(egui::LayerId::new(
+                egui::Order::Tooltip,
+                Id::new("tile_drag_ghost"),
+            ));
+            let galley = tip.layout_no_wrap(title, FontId::proportional(m.font), pal.text);
+            let r = Rect::from_min_size(p + vec2(14.0, 14.0), galley.size() + vec2(m.pad * 2.0, m.pad));
+            tip.rect_filled(r, CornerRadius::same(m.radius), pal.layer);
+            tip.rect_stroke(
+                r,
+                CornerRadius::same(m.radius),
+                Stroke::new(1.0_f32, pal.divider),
+                StrokeKind::Inside,
+            );
+            tip.galley(r.min + vec2(m.pad, m.pad * 0.5), galley, pal.text);
         }
-        if tab.view_dirty {
-            rebuild_view(tab);
+        if released || !down {
+            self.tab_drag = None;
+            if let Some((tid, zone)) = target {
+                self.drop_tab(dragged, tid, zone);
+            }
         }
-        egui::CentralPanel::default()
-            .frame(layer_frame(
-                &pal,
-                m.radius,
-                m.pad * 0.5,
-                0.0,
-                0.0,
-                0.0,
-                false,
-            ))
-            .show(ctx, |ui| {
-                table_ui(
-                    ui,
-                    &m,
-                    &pal,
-                    tab,
-                    cols,
-                    cut_path.as_deref(),
-                    can_paste,
-                    has_peazip,
-                    actions,
-                );
-            });
     }
 
     // ------------------------------------------------------------------ dialogs
@@ -3962,7 +5107,7 @@ impl Explorer {
         }
         if rescan {
             self.indexer.clear();
-            self.start_indexing();
+            self.start_indexing(true);
         }
         if choose {
             if let Some(p) = rfd::FileDialog::new()
@@ -3972,7 +5117,7 @@ impl Explorer {
                 self.index_dir = p.clone();
                 self.settings.index_dir = Some(p.clone());
                 self.indexer.load(&p);
-                self.start_indexing();
+                self.start_indexing(true);
             }
         }
         if closed {
@@ -4163,51 +5308,130 @@ impl Explorer {
         }
     }
 
+    /// Asks, one clashing item at a time (like Explorer), whether to replace it, keep both with a
+    /// "(n)" suffix, or skip it. "Do this for all" answers the remaining ones the same way.
     fn ui_conflict(&mut self, ctx: &egui::Context) {
-        let Some(c) = self.conflict.take() else {
+        let Some(mut c) = self.conflict.take() else {
+            return;
+        };
+        let Some((src, dst)) = c.todo.front().cloned() else {
+            self.run_paste(c.ready, c.cut);
             return;
         };
         let (m, pal) = (self.m, self.pal);
-        let name = c
-            .destination
+        let same = src == dst; // pasting a copy into the folder it came from
+        let name = dst
             .file_name()
             .map(|n| n.to_string_lossy().into_owned())
             .unwrap_or_default();
+        let taken: HashSet<PathBuf> = c
+            .ready
+            .iter()
+            .map(|r| r.dst.clone())
+            .chain(c.todo.iter().map(|(_, d)| d.clone()))
+            .collect();
+        let keep_name = lowest_free_name(&dst, &taken, src.is_dir())
+            .file_name()
+            .map(|n| n.to_string_lossy().into_owned())
+            .unwrap_or_default();
+        let remaining = c.todo.len() - 1;
+        let message = if same {
+            format!("“{name}” is already in this folder.")
+        } else {
+            format!("A file or folder named “{name}” already exists here.")
+        };
+        let mut all = c.apply_all;
         let mut choice = 0;
         let closed = dialog_shell(
             ctx,
             &m,
             &pal,
             "conflict",
-            "Replace or keep?",
+            "Item already exists",
             true,
-            m.s * 420.0,
+            m.s * 460.0,
             |ui| {
-                ui.label(format!(
-                    "A file or folder named “{name}” already exists here."
-                ));
+                ui.label(&message);
+                ui.add_space(m.pad * 0.5);
+                ui.label(
+                    RichText::new(format!("Keep both saves the new item as “{keep_name}”."))
+                        .color(pal.text_secondary),
+                );
+                if remaining > 0 {
+                    ui.add_space(m.pad * 0.5);
+                    ui.checkbox(
+                        &mut all,
+                        format!(
+                            "Do this for the {remaining} remaining conflict{}",
+                            if remaining == 1 { "" } else { "s" }
+                        ),
+                    );
+                }
                 ui.add_space(m.pad * 1.5);
                 ui.horizontal(|ui| {
-                    if primary_button(ui, &m, &pal, "Replace").clicked() {
-                        choice = 1;
+                    if same {
+                        if primary_button(ui, &m, &pal, "Keep both").clicked() {
+                            choice = 2;
+                        }
+                    } else {
+                        if primary_button(ui, &m, &pal, "Replace").clicked() {
+                            choice = 1;
+                        }
+                        if secondary_button(ui, &m, "Keep both").clicked() {
+                            choice = 2;
+                        }
                     }
-                    if secondary_button(ui, &m, "Keep both").clicked() {
-                        choice = 2;
+                    if secondary_button(ui, &m, "Skip").clicked() {
+                        choice = 3;
                     }
                     if secondary_button(ui, &m, "Cancel").clicked() {
-                        choice = 3;
+                        choice = 4;
                     }
                 });
             },
         );
         match (choice, closed) {
-            (1, _) => self.finish_paste(c.source, c.destination, c.cut, true),
-            (2, _) => {
-                let unique = unique_copy_name(&c.destination);
-                self.finish_paste(c.source, unique, c.cut, false);
+            (4, _) | (_, true) => {} // cancel the whole paste
+            (0, false) => {
+                c.apply_all = all;
+                self.conflict = Some(c);
             }
-            (3, _) | (_, true) => {}
-            _ => self.conflict = Some(c),
+            (ch, _) => {
+                let n = if all { c.todo.len() } else { 1 };
+                for _ in 0..n {
+                    let Some((src, dst)) = c.todo.pop_front() else {
+                        break;
+                    };
+                    match ch {
+                        1 if src != dst => c.ready.push(PasteItem {
+                            src,
+                            dst,
+                            replace: true,
+                        }),
+                        1 | 2 => {
+                            let taken: HashSet<PathBuf> = c
+                                .ready
+                                .iter()
+                                .map(|r| r.dst.clone())
+                                .chain(c.todo.iter().map(|(_, d)| d.clone()))
+                                .collect();
+                            let new = lowest_free_name(&dst, &taken, src.is_dir());
+                            c.ready.push(PasteItem {
+                                src,
+                                dst: new,
+                                replace: false,
+                            });
+                        }
+                        _ => {} // skip this one
+                    }
+                }
+                if c.todo.is_empty() {
+                    self.run_paste(c.ready, c.cut);
+                } else {
+                    c.apply_all = all;
+                    self.conflict = Some(c);
+                }
+            }
         }
     }
 }
@@ -4267,11 +5491,32 @@ impl eframe::App for Explorer {
         if ctx.input(|i| i.viewport().close_requested()) {
             save_settings(&self.settings);
             self.indexer.save_if_dirty(&self.index_dir, true);
+            // Everything that matters is saved. Leaving through the normal shutdown path first stops
+            // and joins the scanner/watcher threads and tears down the GL context, which is where the
+            // visible delay comes from; the OS reclaims all of that instantly.
+            std::process::exit(0);
         }
     }
 }
 
 fn main() -> eframe::Result<()> {
+    // The release build has no console, so a panic would otherwise vanish without a trace.
+    std::panic::set_hook(Box::new(|info| {
+        use std::io::Write;
+        let dir = app_dir();
+        let _ = fs::create_dir_all(&dir);
+        if let Ok(mut f) = fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(dir.join("crash.log"))
+        {
+            let _ = writeln!(
+                f,
+                "---- panic ----\n{info}\n{}\n",
+                std::backtrace::Backtrace::force_capture()
+            );
+        }
+    }));
     // Assumes main.rs is in src/ and logo.ico is in assets/.
     let rgba = image::load_from_memory(include_bytes!("../assets/logo.ico"))
         .expect("Could not load assets/logo.ico")
