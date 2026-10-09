@@ -9,7 +9,6 @@ use eframe::egui::{
 };
 
 use std::collections::BTreeMap;
-use std::task::Context;
 // ----------------------------------------------------------------------------------------------
 // Accent colour (Windows "Accent color" setting)
 
