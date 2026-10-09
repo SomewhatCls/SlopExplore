@@ -1,9 +1,13 @@
 //! Fluent 2 / Windows 11 look: colour tokens, accent colour, Mica backdrop, DPI-aware metrics.
+#[cfg(target_os = "windows")]
+use eframe::egui::{
+    FontDefinitions, FontData
+};
 
 use eframe::egui::{
-    self, style::ScrollStyle, Color32, CornerRadius, FontData, FontDefinitions, FontFamily, FontId, Stroke,
-    TextStyle, Theme, Visuals,
+    self, style::ScrollStyle, Color32, CornerRadius, FontId, Stroke, FontFamily, TextStyle, Theme, Visuals
 };
+
 use std::collections::BTreeMap;
 
 // ----------------------------------------------------------------------------------------------
