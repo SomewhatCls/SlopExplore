@@ -2341,7 +2341,7 @@ fn nav_item(
     let inner = rect.shrink2(vec2(0.0, 1.0));
     let r = CornerRadius::same(m.radius);
     if selected {
-        ui.painter().rect_filled(inner, r, pal.control_hover);
+        ui.painter().rect_filled(inner, r, pal.control);
         if resp.hovered() {
             ui.painter().rect_filled(inner, r, pal.hover);
         }
