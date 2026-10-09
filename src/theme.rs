@@ -74,6 +74,84 @@ pub fn system_text_scale() -> f32 {
     1.0
 }
 
+/// False when Windows has transparency effects switched off ("Transparency effects" setting) or
+/// Battery Saver is on. Mica is not drawn then, so the app must paint opaque backgrounds itself.
+#[cfg(windows)]
+pub fn system_transparency() -> bool {
+    use winreg::{enums::HKEY_CURRENT_USER, RegKey};
+    #[repr(C)]
+    struct PowerStatus {
+        ac_line: u8,
+        battery_flag: u8,
+        battery_percent: u8,
+        system_status_flag: u8, // 1 = Battery Saver is on
+        life_time: u32,
+        full_life_time: u32,
+    }
+    #[link(name = "kernel32")]
+    extern "system" {
+        fn GetSystemPowerStatus(s: *mut PowerStatus) -> i32;
+    }
+    let enabled = RegKey::predef(HKEY_CURRENT_USER)
+        .open_subkey(r"Software\Microsoft\Windows\CurrentVersion\Themes\Personalize")
+        .ok()
+        .and_then(|k| k.get_value::<u32, _>("EnableTransparency").ok())
+        .map(|v| v != 0)
+        .unwrap_or(true);
+    let mut st = PowerStatus {
+        ac_line: 0,
+        battery_flag: 0,
+        battery_percent: 0,
+        system_status_flag: 0,
+        life_time: 0,
+        full_life_time: 0,
+    };
+    let saver = unsafe { GetSystemPowerStatus(&mut st) } != 0 && st.system_status_flag & 1 != 0;
+    enabled && !saver
+}
+#[cfg(not(windows))]
+pub fn system_transparency() -> bool {
+    true
+}
+
+/// Hides the window at once, so closing looks instant even if saving takes a moment.
+#[cfg(windows)]
+pub fn hide_window(window: &impl raw_window_handle::HasWindowHandle) {
+    use raw_window_handle::RawWindowHandle;
+    #[link(name = "user32")]
+    extern "system" {
+        fn ShowWindow(hwnd: isize, cmd: i32) -> i32;
+    }
+    if let Ok(handle) = window.window_handle() {
+        if let RawWindowHandle::Win32(w) = handle.as_raw() {
+            unsafe {
+                ShowWindow(w.hwnd.get(), 0); // SW_HIDE
+            }
+        }
+    }
+}
+#[cfg(not(windows))]
+pub fn hide_window(_window: &impl raw_window_handle::HasWindowHandle) {}
+
+/// Ends the process immediately. Normal exit runs every DLL's detach code (GPU drivers, DWM
+/// helpers), which is what can stall or freeze a transparent window while it is being destroyed.
+#[cfg(windows)]
+pub fn terminate_now() -> ! {
+    #[link(name = "kernel32")]
+    extern "system" {
+        fn GetCurrentProcess() -> isize;
+        fn TerminateProcess(h: isize, code: u32) -> i32;
+    }
+    unsafe {
+        TerminateProcess(GetCurrentProcess(), 0);
+    }
+    std::process::exit(0)
+}
+#[cfg(not(windows))]
+pub fn terminate_now() -> ! {
+    std::process::exit(0)
+}
+
 // ----------------------------------------------------------------------------------------------
 // Mica
 
@@ -110,6 +188,8 @@ pub struct Palette {
     pub divider: Color32,
     pub selected: Color32,
     pub selected_hover: Color32,
+    /// Accent-tinted fill for list rows / navigation items under the pointer.
+    pub hover: Color32,
     pub danger: Color32,
     pub danger_bg: Color32,
 }
@@ -138,14 +218,15 @@ impl Palette {
                 text: Color32::WHITE,
                 text_secondary: a(255, 0.786),
                 text_disabled: a(255, 0.36),
-                subtle_hover: a(255, 0.0605),
-                subtle_pressed: a(255, 0.0419),
+                subtle_hover: a(255, 0.10),
+                subtle_pressed: a(255, 0.065),
                 control: a(255, 0.0605),
-                control_hover: a(255, 0.0837),
+                control_hover: a(255, 0.13),
                 control_stroke: a(255, 0.0698),
                 divider: a(255, 0.0837),
                 selected: with_alpha(acc, 0.26),
                 selected_hover: with_alpha(acc, 0.34),
+                hover: with_alpha(acc, 0.22),
                 danger: Color32::from_rgb(0xFF, 0x99, 0xA4),
                 danger_bg: Color32::from_rgb(0x44, 0x27, 0x26),
             }
@@ -158,14 +239,15 @@ impl Palette {
                 text: Color32::from_rgb(0x1A, 0x1A, 0x1A),
                 text_secondary: a(0, 0.606),
                 text_disabled: a(0, 0.36),
-                subtle_hover: a(0, 0.0373),
-                subtle_pressed: a(0, 0.0241),
+                subtle_hover: a(0, 0.075),
+                subtle_pressed: a(0, 0.05),
                 control: a(255, 0.70),
                 control_hover: a(0xF9, 0.50),
                 control_stroke: a(0, 0.0578),
                 divider: a(0, 0.0803),
                 selected: with_alpha(acc, 0.16),
                 selected_hover: with_alpha(acc, 0.24),
+                hover: with_alpha(acc, 0.14),
                 danger: Color32::from_rgb(0xC4, 0x2B, 0x1C),
                 danger_bg: Color32::from_rgb(0xFD, 0xE7, 0xE9),
             }
@@ -255,6 +337,17 @@ pub fn apply_style(ctx: &egui::Context, m: &Metrics, accent: Accent) {
     }
 }
 
+/// One shadow for every popup: menus, dialogs, tooltips.
+pub fn popup_shadow(dark: bool) -> egui::Shadow {
+    // This is broken; While working on tiny popups such as the close buttons, it fails to draw proper shadows behind large popups such as the property window.
+    egui::Shadow {
+        offset: [0, 8],
+        blur: 64,
+        spread: 0,
+        color: Color32::from_black_alpha(if dark { 115 } else { 42 }),
+    }
+}
+
 fn visuals(p: &Palette, m: &Metrics) -> Visuals {
     let mut v = if p.dark { Visuals::dark() } else { Visuals::light() };
     let r = CornerRadius::same(m.radius);
@@ -263,7 +356,7 @@ fn visuals(p: &Palette, m: &Metrics) -> Visuals {
     v.window_stroke = Stroke::new(1.0_f32, p.divider);
     v.window_corner_radius = CornerRadius::same(m.radius * 2);
     v.menu_corner_radius = CornerRadius::same(m.radius * 2);
-    let shadow = egui::Shadow { offset: [0, 8], blur: 28, spread: 0, color: Color32::from_black_alpha(if p.dark { 110 } else { 50 }) };
+    let shadow = popup_shadow(p.dark);
     v.window_shadow = shadow;
     v.popup_shadow = shadow;
     v.extreme_bg_color = if p.dark { a(255, 0.0605) } else { a(255, 0.75) };
