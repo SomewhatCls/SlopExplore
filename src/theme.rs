@@ -9,7 +9,7 @@ use eframe::egui::{
 };
 
 use std::collections::BTreeMap;
-
+use std::task::Context;
 // ----------------------------------------------------------------------------------------------
 // Accent colour (Windows "Accent color" setting)
 
@@ -237,21 +237,21 @@ impl Palette {
         } else {
             Self {
                 dark, mica, accent: acc, on_accent,
-                base: Color32::from_rgb(0xF3, 0xF3, 0xF3),
-                layer: if mica { a(255, 0.55) } else { Color32::from_rgb(0xFB, 0xFB, 0xFB) },
-                flyout: Color32::from_rgb(0xF9, 0xF9, 0xF9),
+                base: Color32::from_rgb(215, 215, 215),
+                layer: if mica { Color32::from_rgba_unmultiplied(215, 215, 215, 200) } else { Color32::from_rgb(0xFB, 0xFB, 0xFB) },
+                flyout: Color32::from_rgb(245, 245, 245),
                 text: Color32::from_rgb(0x1A, 0x1A, 0x1A),
                 text_secondary: a(0, 0.606),
                 text_disabled: a(0, 0.36),
                 subtle_hover: a(0, 0.075),
                 subtle_pressed: a(0, 0.05),
-                control: a(255, 0.70),
+                control: a(215, 0.5),
                 control_hover: a(0xF9, 0.50),
                 control_stroke: a(0, 0.0578),
-                divider: a(0, 0.0803),
-                selected: with_alpha(acc, 0.16),
-                selected_hover: with_alpha(acc, 0.24),
-                hover: with_alpha(acc, 0.14),
+                divider: a(0, 0.15),
+                selected: with_alpha(acc, 0.12),
+                selected_hover: with_alpha(acc, 0.15),
+                hover: with_alpha(acc, 0.10),
                 danger: Color32::from_rgb(0xC4, 0x2B, 0x1C),
                 danger_bg: Color32::from_rgb(0xFD, 0xE7, 0xE9),
             }
@@ -363,8 +363,8 @@ fn visuals(p: &Palette, m: &Metrics) -> Visuals {
     let shadow = popup_shadow(p.dark);
     v.window_shadow = shadow;
     v.popup_shadow = shadow;
-    v.extreme_bg_color = if p.dark { a(255, 0.0605) } else { a(255, 0.75) };
     v.faint_bg_color = p.subtle_hover;
+    v.extreme_bg_color = p.selected_hover;
     v.selection.bg_fill = with_alpha(p.accent, 0.40);
     v.selection.stroke = Stroke::new(1.0_f32, p.accent);
     v.hyperlink_color = p.accent;
