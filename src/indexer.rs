@@ -13,13 +13,13 @@ use eframe::egui;
 use notify::{EventKind, RecommendedWatcher, RecursiveMode, Watcher};
 use serde::{Deserialize, Serialize};
 use std::{
-    collections::HashMap,
+    collections::{HashMap, HashSet},
     fs,
     path::{Path, PathBuf},
     sync::{
         atomic::{AtomicBool, AtomicU64, Ordering},
         mpsc::Sender,
-        Arc, RwLock,
+        Arc, Mutex, RwLock,
     },
     time::{Duration, SystemTime, UNIX_EPOCH},
 };
@@ -29,6 +29,11 @@ const INDEX_FILE: &str = "folder_sizes.json";
 const TTL_SECS: u64 = 6 * 3600;
 /// Entries not refreshed for this long are dropped when the cache is saved.
 const PRUNE_SECS: u64 = 30 * 24 * 3600;
+/// Only the top levels of a scan and folders at least this big are cached. Caching every folder
+/// of a whole drive meant millions of entries: gigabytes of RAM and a cache file that took
+/// seconds to write when closing the app.
+const KEEP_BYTES: u64 = 64 << 20;
+const KEEP_DEPTH: usize = 4;
 
 #[derive(Clone, Serialize, Deserialize)]
 pub struct CachedFolder {
@@ -97,6 +102,17 @@ impl Indexer {
             }
             self.cache_dirty.store(true, Ordering::Relaxed);
         }
+    }
+
+    /// Forgets everything: stops a running scan, empties the cache and removes the saved file.
+    pub fn delete_index(&self, dir: &Path) {
+        self.generation.fetch_add(1, Ordering::SeqCst);
+        if let Ok(mut c) = self.cache.write() {
+            c.clear();
+        }
+        self.cache_dirty.store(false, Ordering::Relaxed);
+        let _ = fs::remove_file(dir.join(INDEX_FILE));
+        let _ = fs::remove_file(dir.join(format!("{INDEX_FILE}.tmp")));
     }
 
     pub fn is_dirty(&self) -> bool {
@@ -272,8 +288,11 @@ fn scan(root: &Path, root_stamp: u128, cache: &Cache, generation: &AtomicU64, my
                 }
             }
             Step::End => {
+                let depth = stack.len(); // counts the folder being finished
                 let done = stack.pop()?;
-                pending.push((done.path, CachedFolder { size: done.total, modified_ns: done.stamp, scanned_at: now }));
+                if depth <= KEEP_DEPTH || done.total >= KEEP_BYTES {
+                    pending.push((done.path, CachedFolder { size: done.total, modified_ns: done.stamp, scanned_at: now }));
+                }
                 match stack.last_mut() {
                     Some(parent) => parent.total = parent.total.saturating_add(done.total),
                     None => {
@@ -304,24 +323,50 @@ fn lower_priority() {}
 // ----------------------------------------------------------------------------------------------
 // File watcher: live refresh + cache invalidation
 
+/// Most distinct changed paths remembered between two UI frames; more than that collapses into
+/// a single "something changed" marker (the empty path).
+const MAX_PENDING: usize = 2048;
+
 pub struct DirWatcher {
     watcher: RecommendedWatcher,
     current: Option<PathBuf>,
+    pending: Arc<Mutex<HashSet<PathBuf>>>,
 }
 
 impl DirWatcher {
-    pub fn new(ctx: egui::Context, tx: Sender<Vec<PathBuf>>) -> Option<Self> {
+    pub fn new(ctx: egui::Context) -> Option<Self> {
+        // Events go into a bounded set that the UI drains once per frame. (An unbounded channel
+        // grows without limit while the window is minimised or hidden and nobody reads it.)
+        let pending: Arc<Mutex<HashSet<PathBuf>>> = Arc::new(Mutex::new(HashSet::new()));
+        let sink = Arc::clone(&pending);
         let watcher = notify::recommended_watcher(move |res: notify::Result<notify::Event>| {
             if let Ok(ev) = res {
                 if matches!(ev.kind, EventKind::Access(_)) || ev.paths.is_empty() {
                     return;
                 }
-                let _ = tx.send(ev.paths);
+                if let Ok(mut set) = sink.lock() {
+                    for p in ev.paths {
+                        if set.len() < MAX_PENDING {
+                            set.insert(p);
+                        } else {
+                            set.insert(PathBuf::new());
+                            break;
+                        }
+                    }
+                }
                 ctx.request_repaint_after(Duration::from_millis(300));
             }
         })
         .ok()?;
-        Some(Self { watcher, current: None })
+        Some(Self { watcher, current: None, pending })
+    }
+
+    /// Changed paths since the last call. An empty path means "too many to list".
+    pub fn take(&self) -> Vec<PathBuf> {
+        match self.pending.lock() {
+            Ok(mut s) => std::mem::take(&mut *s).into_iter().collect(),
+            Err(_) => Vec::new(),
+        }
     }
 
     pub fn watch(&mut self, dir: &Path) {

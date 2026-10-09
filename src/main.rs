@@ -3,6 +3,7 @@
 mod fsops;
 mod icons;
 mod indexer;
+mod peers;
 mod theme;
 mod trashbin;
 
@@ -16,6 +17,7 @@ use eframe::{
 use fsops::*;
 use icons::*;
 use indexer::*;
+use peers::{cursor_screen_pos, now_ms, Peers, WinInfo};
 use serde::{Deserialize, Serialize};
 use std::{
     cmp::Ordering,
@@ -240,6 +242,9 @@ struct Settings {
     index_dir: Option<PathBuf>,
     /// Widths (at 14 pt text) of Date modified, Type, Size.
     col_widths: [f32; 3],
+    /// Inner size of the window when it was last closed (points), and whether it was maximised.
+    window_size: Option<[f32; 2]>,
+    maximized: bool,
 }
 
 impl Default for Settings {
@@ -254,6 +259,8 @@ impl Default for Settings {
             date_format: DateFormat::default(),
             index_dir: None,
             col_widths: [150.0, 110.0, 90.0],
+            window_size: None,
+            maximized: false,
         }
     }
 }
@@ -525,6 +532,7 @@ enum Action {
     NewTab,
     CloseTab(usize),
     ClosePane(u64),
+    OpenTerminal(PathBuf),
     SwitchTab(usize),
     StepTab(i32),
     Back,
@@ -761,7 +769,6 @@ struct Explorer {
     msg_tx: Sender<AppMsg>,
     msg_rx: Receiver<AppMsg>,
     idx_rx: Receiver<IndexMsg>,
-    fs_rx: Receiver<Vec<PathBuf>>,
     indexer: Indexer,
     watcher: Option<DirWatcher>,
     list_debounce: Debounce,
@@ -798,6 +805,16 @@ struct Explorer {
     /// What the folder-size indexer was last started for; avoids restarting an identical scan.
     index_sig: Option<(u64, usize)>,
     reindex_force: bool,
+
+    /// Other SlopExplore windows (tab hand-over).
+    peers: Peers,
+    own_info: Option<WinInfo>,
+    info_stamp: Instant,
+    /// Windows transparency effects available (off in Battery Saver / when disabled in Settings).
+    transparency: bool,
+    backdrop_transp: Option<bool>,
+    /// (when checked, whether another SlopExplore window is under the pointer) while dragging a tab.
+    peer_under: (Instant, bool),
 }
 
 impl Explorer {
@@ -815,17 +832,19 @@ impl Explorer {
 
         let (msg_tx, msg_rx) = mpsc::channel();
         let (idx_tx, idx_rx) = mpsc::channel();
-        let (fs_tx, fs_rx) = mpsc::channel();
         let index_dir = settings
             .index_dir
             .clone()
             .filter(|p| p.is_dir())
             .unwrap_or_else(app_dir);
         let indexer = Indexer::new(ctx.clone(), idx_tx, &index_dir);
-        let watcher = DirWatcher::new(ctx.clone(), fs_tx);
+        let watcher = DirWatcher::new(ctx.clone());
 
-        let start = dirs::home_dir()
+        let start = START_DIR
+            .get()
+            .cloned()
             .filter(|p| p.is_dir())
+            .or_else(|| dirs::home_dir().filter(|p| p.is_dir()))
             .or_else(|| std::env::current_dir().ok())
             .unwrap_or_else(|| PathBuf::from("."));
 
@@ -859,7 +878,6 @@ impl Explorer {
             msg_tx,
             msg_rx,
             idx_rx,
-            fs_rx,
             indexer,
             watcher,
             list_debounce: Debounce::default(),
@@ -890,6 +908,12 @@ impl Explorer {
             tab_drag: None,
             index_sig: None,
             reindex_force: false,
+            peers: Peers::new(ctx.clone(), &app_dir()),
+            own_info: None,
+            info_stamp: Instant::now(),
+            transparency: system_transparency(),
+            backdrop_transp: None,
+            peer_under: (Instant::now(), false),
         };
         app.load_tab(0);
         app.on_active_changed();
@@ -1162,10 +1186,33 @@ impl Explorer {
     }
 
     /// A tab was dropped on a pane: on its edge it splits the pane, in the middle it takes the pane's place.
-    fn drop_tab(&mut self, dragged: u64, target: u64, zone: DropZone) {
+    fn drop_tab(&mut self, dragged: u64, mut target: u64, zone: DropZone) {
         let Some(di) = self.tabs.iter().position(|t| t.id == dragged) else {
             return;
         };
+        if dragged == target && zone != DropZone::Center && self.tiles.is_none() {
+            // Dragging the tab you are looking at onto the edge of the view: it becomes the new
+            // pane, and the pane it leaves behind shows another tab (a fresh one if there is none).
+            let other = self
+                .tabs
+                .iter()
+                .skip(di + 1)
+                .chain(self.tabs.iter().take(di))
+                .next()
+                .map(|t| t.id);
+            target = match other {
+                Some(id) => id,
+                None => {
+                    let id = self.next_tab_id;
+                    self.next_tab_id += 1;
+                    let dir = self.tabs[di].dir.clone();
+                    self.tabs.push(Tab::new(id, dir));
+                    let last = self.tabs.len() - 1;
+                    self.load_tab(last);
+                    id
+                }
+            };
+        }
         let mut tree = self.tiles.take().unwrap_or(Tile::Leaf(target));
         if dragged != target {
             if zone == DropZone::Center {
@@ -1478,9 +1525,16 @@ impl Explorer {
         }
 
         // Live updates from the file watcher.
-        while let Ok(paths) = self.fs_rx.try_recv() {
+        let changed = self.watcher.as_ref().map(|w| w.take()).unwrap_or_default();
+        if !changed.is_empty() {
             let dir = self.tabs[self.active].dir.clone();
-            for p in paths {
+            for p in changed {
+                if p.as_os_str().is_empty() {
+                    // Too many changes to list: refresh everything.
+                    self.list_debounce.poke();
+                    self.size_debounce.poke();
+                    continue;
+                }
                 if p.starts_with(&self.index_dir) {
                     continue; // our own cache file
                 }
@@ -1490,6 +1544,14 @@ impl Explorer {
                 } else if p.starts_with(&dir) {
                     self.size_debounce.poke();
                 }
+            }
+        }
+
+        // Folders other windows dragged over to us arrive as new tabs.
+        for dir in self.peers.take_inbox() {
+            if dir.is_dir() {
+                self.new_tab(dir);
+                self.ctx.send_viewport_cmd(egui::ViewportCommand::Focus);
             }
         }
         if self
@@ -1539,6 +1601,7 @@ impl Explorer {
             self.last_poll = Instant::now();
             self.text_scale = system_text_scale();
             self.sys_accent = system_accent();
+            self.transparency = system_transparency();
         }
         let accent = if self.settings.use_system_accent {
             self.sys_accent.unwrap_or_else(Accent::fallback)
@@ -1558,10 +1621,12 @@ impl Explorer {
             self.applied_style = Some((font, accent));
         }
         let theme = ctx.theme();
-        if self.backdrop_theme != Some(theme) {
-            self.mica = apply_backdrop(frame, theme == egui::Theme::Dark);
+        if self.backdrop_theme != Some(theme) || self.backdrop_transp != Some(self.transparency) {
+            // Without transparency effects (Battery Saver etc.) Windows draws no Mica: paint opaque instead.
+            self.mica = self.transparency && apply_backdrop(frame, theme == egui::Theme::Dark);
             style_frameless(frame);
             self.backdrop_theme = Some(theme);
+            self.backdrop_transp = Some(self.transparency);
         }
         self.pal = Palette::new(theme, accent, self.mica);
     }
@@ -1738,6 +1803,11 @@ impl Explorer {
                     self.tiles = remove_leaf(t, id);
                 }
                 self.fix_tiles();
+            }
+            Action::OpenTerminal(dir) => {
+                if let Err(e) = open_terminal(&dir) {
+                    self.tabs[ti].error = Some(format!("Could not open a terminal: {e}"));
+                }
             }
             Action::SwitchTab(i) => self.activate_tab(i),
             Action::StepTab(d) => {
@@ -2094,6 +2164,28 @@ fn hover_fill(ui: &Ui, rect: Rect, resp: &egui::Response, pal: &Palette, m: &Met
         .rect_filled(rect, CornerRadius::same(m.radius), c);
 }
 
+/// Hover / press feedback for list-like items (quick access, drives): accent-tinted fill plus a
+/// small accent marker, so the item under the pointer is easy to spot.
+fn list_hover(ui: &Ui, rect: Rect, resp: &egui::Response, pal: &Palette, m: &Metrics) {
+    let down = resp.is_pointer_button_down_on();
+    if !down && !resp.hovered() {
+        return;
+    }
+    let fill = if down {
+        pal.hover.gamma_multiply(1.6)
+    } else {
+        pal.hover
+    };
+    ui.painter()
+        .rect_filled(rect, CornerRadius::same(m.radius), fill);
+    let marker = Rect::from_center_size(
+        pos2(rect.left() + m.s * 2.0, rect.center().y),
+        vec2(m.s * 3.0, m.font * 0.8),
+    );
+    ui.painter()
+        .rect_filled(marker, CornerRadius::same(2), pal.accent.gamma_multiply(0.6));
+}
+
 fn icon_button(
     ui: &mut Ui,
     m: &Metrics,
@@ -2251,6 +2343,9 @@ fn nav_item(
     let r = CornerRadius::same(m.radius);
     if selected {
         ui.painter().rect_filled(inner, r, pal.control_hover);
+        if resp.hovered() {
+            ui.painter().rect_filled(inner, r, pal.hover);
+        }
         let pill = Rect::from_center_size(
             pos2(inner.left() + m.s * 2.0, inner.center().y),
             vec2(m.s * 3.0, m.font * 1.1),
@@ -2258,7 +2353,7 @@ fn nav_item(
         ui.painter()
             .rect_filled(pill, CornerRadius::same(2), pal.accent);
     } else {
-        hover_fill(ui, inner, &resp, pal, m);
+        list_hover(ui, inner, &resp, pal, m);
     }
     draw_icon(
         ui,
@@ -2302,6 +2397,9 @@ fn drive_card(
     let r = CornerRadius::same(m.radius);
     if active {
         ui.painter().rect_filled(inner, r, pal.control_hover);
+        if resp.hovered() {
+            ui.painter().rect_filled(inner, r, pal.hover);
+        }
         let pill = Rect::from_center_size(
             pos2(inner.left() + m.s * 2.0, inner.center().y),
             vec2(m.s * 3.0, m.font * 1.6),
@@ -2309,7 +2407,7 @@ fn drive_card(
         ui.painter()
             .rect_filled(pill, CornerRadius::same(2), pal.accent);
     } else {
-        hover_fill(ui, inner, &resp, pal, m);
+        list_hover(ui, inner, &resp, pal, m);
     }
     let mount = d.mount_point.display().to_string();
     let title = if d.name.is_empty() {
@@ -2636,7 +2734,7 @@ fn dialog_shell(
                 ui.painter().rect_filled(
                     rect,
                     CornerRadius::ZERO,
-                    Color32::from_black_alpha(if pal.dark { 130 } else { 70 }),
+                    Color32::from_black_alpha(if pal.dark { 95 } else { 48 }),
                 );
             });
     }
@@ -2651,6 +2749,8 @@ fn dialog_shell(
         .frame(
             egui::Frame::window(&ctx.style())
                 .fill(pal.flyout)
+                .shadow(popup_shadow(pal.dark))
+                .stroke(Stroke::new(1.0_f32, pal.divider))
                 .inner_margin(Margin::same((m.pad * 2.0) as i8)),
         )
         .show(ctx, |ui| {
@@ -3200,7 +3300,7 @@ fn trash_table_ui(
                 let bg = if is_sel {
                     sel_fill(pal, resp.hovered())
                 } else if resp.hovered() {
-                    pal.subtle_hover
+                    pal.hover
                 } else {
                     Color32::TRANSPARENT
                 };
@@ -3696,6 +3796,10 @@ fn table_ui(
             actions.push(Action::Paste);
             ui.close_menu();
         }
+        if menu_item(ui, m, pal, Some("code"), "Open in Terminal", None, true) {
+            actions.push(Action::OpenTerminal(dir.clone()));
+            ui.close_menu();
+        }
         ui.separator();
         if menu_item(ui, m, pal, Some("refresh"), "Refresh", Some("F5"), true) {
             actions.push(Action::Refresh);
@@ -3776,7 +3880,7 @@ fn table_ui(
                 let bg = if is_sel {
                     sel_fill(pal, resp.hovered())
                 } else if resp.hovered() {
-                    pal.subtle_hover
+                    pal.hover
                 } else {
                     Color32::TRANSPARENT
                 };
@@ -4037,7 +4141,7 @@ fn table_ui(
 
 // ==============================================================================================
 // Panels
-//8px window decoration radius for linux
+//window decoration radius for linux
 const RADIUS: u8 = if cfg!(target_os = "linux") { 12 } else { 0 };
 
 /// The contents of one pane: the file table (or the Recycle Bin) of `tab`, inside `rect`.
@@ -4936,7 +5040,110 @@ impl Explorer {
         self.tab_drag_overlay(ctx, &panes);
     }
 
-    /// While a tab is being dragged: previews where it would land and performs the drop on release.
+    /// True when the OS cursor is outside this window (only known on Windows).
+    fn cursor_outside_window(&self) -> Option<bool> {
+        let (cx, cy) = cursor_screen_pos()?;
+        let o = self.own_info?;
+        Some(!(cx >= o.rect[0] && cx < o.rect[2] && cy >= o.rect[1] && cy < o.rect[3]))
+    }
+
+    /// A tab was released outside the window: open it in another SlopExplore window under the
+    /// pointer, or in a new window of its own.
+    fn detach_tab(&mut self, dragged: u64) {
+        let Some(ti) = self.tabs.iter().position(|t| t.id == dragged) else {
+            return;
+        };
+        if self.tabs[ti].trash.is_some() {
+            return;
+        }
+        let Some((cx, cy)) = cursor_screen_pos() else {
+            return;
+        };
+        let only = self.tabs.len() <= 1;
+        let everything = self.ctx.input(|i| i.modifiers.shift);
+        match self.peers.window_at(cx, cy) {
+            Some(pid) => {
+                if only || everything {
+                    // Merge this whole window into the other one (the dragged tab goes last, so it
+                    // ends up as the active tab there), then close this window.
+                    let mut dirs: Vec<PathBuf> = self
+                        .tabs
+                        .iter()
+                        .filter(|t| t.id != dragged && t.trash.is_none())
+                        .map(|t| t.dir.clone())
+                        .collect();
+                    dirs.push(self.tabs[ti].dir.clone());
+                    if dirs.iter().all(|d| self.peers.send_tab(pid, d)) {
+                        self.ctx.send_viewport_cmd(egui::ViewportCommand::Close);
+                    }
+                } else {
+                    let dir = self.tabs[ti].dir.clone();
+                    if self.peers.send_tab(pid, &dir) {
+                        self.apply(Action::CloseTab(ti));
+                    }
+                }
+            }
+            None => {
+                if only {
+                    return; // the only tab already is a window of its own
+                }
+                let dir = self.tabs[ti].dir.clone();
+                let ppp = self.ctx.pixels_per_point().max(0.1);
+                spawn_window(
+                    &dir,
+                    Some(((cx / ppp - 80.0).max(0.0), (cy / ppp - 20.0).max(0.0))),
+                );
+                self.apply(Action::CloseTab(ti));
+            }
+        }
+    }
+
+    /// Keeps the saved window size current and tells other windows where this one is.
+    fn track_window(&mut self, ctx: &egui::Context) {
+        let (inner, maxi, mini, full, focused) = ctx.input(|i| {
+            let v = i.viewport();
+            (
+                v.inner_rect,
+                v.maximized.unwrap_or(false),
+                v.minimized.unwrap_or(false),
+                v.fullscreen.unwrap_or(false),
+                i.focused,
+            )
+        });
+        if !mini && !full {
+            self.settings.maximized = maxi;
+            if !maxi {
+                if let Some(r) = inner {
+                    let s = [r.width().round(), r.height().round()];
+                    if s[0] >= 520.0 && s[1] >= 340.0 {
+                        self.settings.window_size = Some(s);
+                    }
+                }
+            }
+        }
+        if let Some(r) = inner {
+            let ppp = ctx.pixels_per_point();
+            let rect = [r.left() * ppp, r.top() * ppp, r.right() * ppp, r.bottom() * ppp];
+            let moved = self
+                .own_info
+                .map_or(true, |o| o.rect.iter().zip(rect.iter()).any(|(a, b)| (a - b).abs() > 0.5));
+            let refocus = focused && self.info_stamp.elapsed() > Duration::from_secs(1);
+            if moved || refocus {
+                let focus_ms = if focused {
+                    now_ms()
+                } else {
+                    self.own_info.map_or(0, |o| o.focus_ms)
+                };
+                let info = WinInfo { rect, focus_ms };
+                self.peers.set_info(info);
+                self.own_info = Some(info);
+                self.info_stamp = Instant::now();
+            }
+        }
+    }
+
+    /// While a tab is being dragged: shows where it would land (clearly, in the accent colour) and
+    /// performs the drop on release.
     fn tab_drag_overlay(&mut self, ctx: &egui::Context, panes: &[(u64, Rect)]) {
         let Some(dragged) = self.tab_drag else {
             return;
@@ -4951,30 +5158,84 @@ impl Explorer {
         let (m, pal) = (self.m, self.pal);
         ctx.set_cursor_icon(egui::CursorIcon::Grabbing);
         ctx.request_repaint();
+        let outside = self.cursor_outside_window() == Some(true);
+        let overlay = ctx.layer_painter(egui::LayerId::new(
+            egui::Order::Foreground,
+            Id::new("tile_drop_preview"),
+        ));
         let mut target: Option<(u64, DropZone)> = None;
-        if let Some(p) = pos {
+
+        if outside {
+            if self.peer_under.0.elapsed() > Duration::from_millis(150) {
+                let over = cursor_screen_pos()
+                    .map_or(false, |(cx, cy)| self.peers.window_at(cx, cy).is_some());
+                self.peer_under = (Instant::now(), over);
+            }
+            let msg = if self.peer_under.1 {
+                if self.tabs.len() > 1 {
+                    "Release to move this tab into that window  (hold Shift: move all tabs)"
+                } else {
+                    "Release to merge this window into that window"
+                }
+            } else if self.tabs.len() > 1 {
+                "Release to open this tab in its own window"
+            } else {
+                "Drop on another SlopExplore window to merge"
+            };
+            let screen = ctx.screen_rect();
+            overlay.rect_filled(screen, CornerRadius::ZERO, Color32::from_black_alpha(110));
+            let band = Rect::from_center_size(
+                screen.center_bottom() - vec2(0.0, m.row_h * 2.0),
+                vec2((screen.width() - m.pad * 4.0).min(m.s * 680.0), m.row_h * 1.6),
+            );
+            overlay.rect_filled(band, CornerRadius::same(m.radius), pal.accent);
+            overlay.text(
+                band.center(),
+                Align2::CENTER_CENTER,
+                msg,
+                FontId::proportional(m.font * 1.05),
+                pal.on_accent,
+            );
+        } else if let Some(p) = pos {
             let already = panes.iter().any(|(t, _)| *t == dragged);
             let can_split = already || panes.len() < 4;
             if let Some((tid, rect)) = panes.iter().find(|(_, r)| r.contains(p)) {
-                if *tid != dragged {
-                    let zone = drop_zone(*rect, p, can_split);
+                let same = *tid == dragged;
+                let zone = drop_zone(*rect, p, can_split && (!same || panes.len() == 1));
+                if !(same && zone == DropZone::Center) {
                     target = Some((*tid, zone));
-                    let painter = ctx.layer_painter(egui::LayerId::new(
-                        egui::Order::Foreground,
-                        Id::new("tile_drop_preview"),
-                    ));
-                    let zr = zone_rect(*rect, zone).shrink(m.s * 3.0);
-                    painter.rect_filled(
+                }
+            }
+            // Dim everything, then light up the exact area the tab will occupy.
+            let all = panes
+                .iter()
+                .fold(Rect::NOTHING, |acc, (_, r)| acc.union(*r));
+            overlay.rect_filled(all, CornerRadius::ZERO, Color32::from_black_alpha(95));
+            if let Some((tid, zone)) = target {
+                if let Some((_, rect)) = panes.iter().find(|(t, _)| *t == tid) {
+                    let zr = zone_rect(*rect, zone).shrink(m.s * 4.0);
+                    overlay.rect_filled(zr, CornerRadius::same(m.radius), pal.accent.gamma_multiply(0.55));
+                    overlay.rect_stroke(
                         zr,
                         CornerRadius::same(m.radius),
-                        pal.accent.gamma_multiply(0.22),
-                    );
-                    painter.rect_stroke(
-                        zr,
-                        CornerRadius::same(m.radius),
-                        Stroke::new(2.0_f32, pal.accent),
+                        Stroke::new(3.0_f32, pal.accent),
                         StrokeKind::Inside,
                     );
+                    let label = match zone {
+                        DropZone::Left => "Open on the left",
+                        DropZone::Right => "Open on the right",
+                        DropZone::Top => "Open above",
+                        DropZone::Bottom => "Open below",
+                        DropZone::Center => "Replace this pane",
+                    };
+                    let g = overlay.layout_no_wrap(
+                        label.to_owned(),
+                        FontId::proportional(m.font * 1.2),
+                        pal.on_accent,
+                    );
+                    let pill = Rect::from_center_size(zr.center(), g.size() + vec2(m.pad * 3.0, m.pad * 1.6));
+                    overlay.rect_filled(pill, CornerRadius::same(m.radius), pal.accent);
+                    overlay.galley(pill.center() - g.size() / 2.0, g, pal.on_accent);
                 }
             }
             // A small label follows the pointer.
@@ -4994,7 +5255,7 @@ impl Explorer {
             tip.rect_stroke(
                 r,
                 CornerRadius::same(m.radius),
-                Stroke::new(1.0_f32, pal.divider),
+                Stroke::new(1.0_f32, pal.accent),
                 StrokeKind::Inside,
             );
             tip.galley(r.min + vec2(m.pad, m.pad * 0.5), galley, pal.text);
@@ -5003,6 +5264,8 @@ impl Explorer {
             self.tab_drag = None;
             if let Some((tid, zone)) = target {
                 self.drop_tab(dragged, tid, zone);
+            } else if outside {
+                self.detach_tab(dragged);
             }
         }
     }
@@ -5016,7 +5279,7 @@ impl Explorer {
         let (m, pal) = (self.m, self.pal);
         let old = self.settings.clone();
         let mut s = old.clone();
-        let (mut rescan, mut choose) = (false, false);
+        let (mut rescan, mut choose, mut delete_index) = (false, false, false);
         let mut font = self.font_edit.unwrap_or(s.font_size);
         let mut font_edit = self.font_edit;
         let index_dir = self.index_dir.display().to_string();
@@ -5091,7 +5354,15 @@ impl Explorer {
                     if secondary_button(ui, &m, "Rescan all").clicked() {
                         rescan = true;
                     }
+                    if danger_button(ui, &m, "Delete index").clicked() {
+                        delete_index = true;
+                    }
                 });
+                ui.label(
+                    RichText::new("Delete index removes all saved folder sizes from memory and disk; the folders on screen are measured again.")
+                        .color(pal.text_secondary)
+                        .size(m.font * 0.9),
+                );
             },
         );
 
@@ -5107,6 +5378,15 @@ impl Explorer {
         }
         if rescan {
             self.indexer.clear();
+            self.start_indexing(true);
+        }
+        if delete_index {
+            self.indexer.delete_index(&self.index_dir);
+            for t in &mut self.tabs {
+                for e in t.entries.iter_mut().filter(|e| e.is_dir) {
+                    e.dir_size = None;
+                }
+            }
             self.start_indexing(true);
         }
         if choose {
@@ -5445,6 +5725,7 @@ impl eframe::App for Explorer {
 
     fn update(&mut self, ctx: &egui::Context, frame: &mut eframe::Frame) {
         self.sync_system(ctx, frame);
+        self.track_window(ctx);
         handle_resize(ctx, &self.m);
         self.pump_messages();
         let rect = ctx.screen_rect();
@@ -5489,13 +5770,30 @@ impl eframe::App for Explorer {
         }
 
         if ctx.input(|i| i.viewport().close_requested()) {
+            // Vanish first, then save: the window is gone the instant the button is pressed.
+            hide_window(frame);
             save_settings(&self.settings);
+            self.peers.shutdown();
             self.indexer.save_if_dirty(&self.index_dir, true);
-            // Everything that matters is saved. Leaving through the normal shutdown path first stops
-            // and joins the scanner/watcher threads and tears down the GL context, which is where the
-            // visible delay comes from; the OS reclaims all of that instantly.
-            std::process::exit(0);
+            // Skip the normal teardown (joining threads, destroying the GL context, DLL detach in
+            // GPU drivers): it is slow and can hang a transparent window. The OS cleans up at once.
+            terminate_now();
         }
+    }
+}
+
+/// Folder a window opened by "drag a tab out" starts in.
+static START_DIR: std::sync::OnceLock<PathBuf> = std::sync::OnceLock::new();
+
+/// Starts another SlopExplore window (its own process) showing `dir`.
+fn spawn_window(dir: &Path, pos: Option<(f32, f32)>) {
+    if let Ok(exe) = std::env::current_exe() {
+        let mut c = std::process::Command::new(exe);
+        c.arg("--open").arg(dir);
+        if let Some((x, y)) = pos {
+            c.arg("--pos").arg(format!("{x:.0},{y:.0}"));
+        }
+        let _ = c.spawn();
     }
 }
 
@@ -5517,6 +5815,30 @@ fn main() -> eframe::Result<()> {
             );
         }
     }));
+
+    // Command line (used when a tab is dragged out into a window of its own).
+    let args: Vec<String> = std::env::args().skip(1).collect();
+    let mut pos: Option<[f32; 2]> = None;
+    let mut k = 0;
+    while k < args.len() {
+        match args[k].as_str() {
+            "--open" if k + 1 < args.len() => {
+                let _ = START_DIR.set(PathBuf::from(&args[k + 1]));
+                k += 1;
+            }
+            "--pos" if k + 1 < args.len() => {
+                if let Some((x, y)) = args[k + 1].split_once(',') {
+                    if let (Ok(x), Ok(y)) = (x.trim().parse::<f32>(), y.trim().parse::<f32>()) {
+                        pos = Some([x, y]);
+                    }
+                }
+                k += 1;
+            }
+            _ => {}
+        }
+        k += 1;
+    }
+
     // Assumes main.rs is in src/ and logo.ico is in assets/.
     let rgba = image::load_from_memory(include_bytes!("../assets/logo.ico"))
         .expect("Could not load assets/logo.ico")
@@ -5528,14 +5850,26 @@ fn main() -> eframe::Result<()> {
         height,
     };
 
+    // Same size as last time.
+    let saved = load_settings();
+    let size = saved
+        .window_size
+        .filter(|s| s[0] >= 520.0 && s[1] >= 340.0 && s[0] <= 10000.0 && s[1] <= 10000.0)
+        .unwrap_or([1180.0, 760.0]);
+    let mut viewport = egui::ViewportBuilder::default()
+        .with_inner_size(size)
+        .with_min_inner_size([520.0, 340.0])
+        .with_resizable(true)
+        .with_decorations(false) // we draw the title bar and caption buttons ourselves
+        .with_transparent(true) // required for the Mica backdrop
+        .with_icon(Arc::new(icon));
+    if let Some(p) = pos {
+        viewport = viewport.with_position(p);
+    } else if saved.maximized {
+        viewport = viewport.with_maximized(true);
+    }
     let options = eframe::NativeOptions {
-        viewport: egui::ViewportBuilder::default()
-            .with_inner_size([1180.0, 760.0])
-            .with_min_inner_size([520.0, 340.0])
-            .with_resizable(true)
-            .with_decorations(false) // we draw the title bar and caption buttons ourselves
-            .with_transparent(true) // required for the Mica backdrop
-            .with_icon(Arc::new(icon)),
+        viewport,
         ..Default::default()
     };
 

@@ -190,6 +190,38 @@ pub fn open_recycle_bin() -> std::io::Result<()> {
     Err(std::io::Error::new(std::io::ErrorKind::Unsupported, "Recycle Bin is not available here"))
 }
 
+/// Opens a terminal window in `dir` (Windows Terminal if installed, else the classic console).
+pub fn open_terminal(dir: &Path) -> std::io::Result<()> {
+    #[cfg(windows)]
+    {
+        use std::os::windows::process::CommandExt;
+        if std::process::Command::new("wt.exe").arg("-d").arg(dir).spawn().is_ok() {
+            return Ok(());
+        }
+        const CREATE_NEW_CONSOLE: u32 = 0x0000_0010;
+        return std::process::Command::new("cmd.exe")
+            .current_dir(dir)
+            .creation_flags(CREATE_NEW_CONSOLE)
+            .spawn()
+            .map(|_| ());
+    }
+    #[cfg(target_os = "macos")]
+    {
+        return std::process::Command::new("open").args(["-a", "Terminal"]).arg(dir).spawn().map(|_| ());
+    }
+    #[cfg(all(unix, not(target_os = "macos")))]
+    {
+        for term in ["x-terminal-emulator", "gnome-terminal", "konsole", "xfce4-terminal", "alacritty", "xterm"] {
+            if std::process::Command::new(term).current_dir(dir).spawn().is_ok() {
+                return Ok(());
+            }
+        }
+        return Err(std::io::Error::new(std::io::ErrorKind::NotFound, "no terminal emulator found"));
+    }
+    #[allow(unreachable_code)]
+    Err(std::io::Error::new(std::io::ErrorKind::Unsupported, "not supported here"))
+}
+
 pub fn find_peazip() -> Option<PathBuf> {
     #[cfg(windows)]
     {
