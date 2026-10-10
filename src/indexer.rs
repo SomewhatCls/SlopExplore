@@ -8,16 +8,28 @@
 //!    (a directory's mtime does not change when a file deeper down grows, so mtime alone goes stale);
 //!  * a file watcher invalidates the changed path and all its ancestors, so new files show up live;
 //!  * the cache is written atomically from a background thread.
+//!
+//! File-name index (search):
+//!  * `FileIndex` keeps, per folder, one compact blob with the names of its direct children.
+//!    Opening a folder records that single level (cheap, one `read_dir`).
+//!  * Searching walks the tree breadth-first *through the index*: folders already known are
+//!    answered from memory, unknown or stale ones are read from disk once and stored, so the
+//!    first deep search of a tree indexes it and later searches are instant.
+//!  * Folders are read by a few parallel readers at slightly-below-normal priority, the walk is
+//!    cancellable within one folder and never follows symlinks/junctions; memory is capped (`MAX_INDEX_BYTES`).
+//!  * The index is saved to `file_names.idx` (background thread, at most once a minute, never
+//!    while closing) and loaded in the background at start-up. Loaded folders are re-validated
+//!    by their modification time before being trusted.
 
 use eframe::egui;
 use notify::{EventKind, RecommendedWatcher, RecursiveMode, Watcher};
 use serde::{Deserialize, Serialize};
 use std::{
-    collections::{HashMap, HashSet},
+    collections::{HashMap, HashSet, VecDeque},
     fs,
     path::{Path, PathBuf},
     sync::{
-        atomic::{AtomicBool, AtomicU64, Ordering},
+        atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering},
         mpsc::Sender,
         Arc, Mutex, RwLock,
     },
@@ -34,6 +46,24 @@ const PRUNE_SECS: u64 = 30 * 24 * 3600;
 /// seconds to write when closing the app.
 const KEEP_BYTES: u64 = 64 << 20;
 const KEEP_DEPTH: usize = 4;
+/// A folder listing younger than this is trusted without even a `stat`.
+const FRESH_SECS: u64 = 300;
+/// Memory budget of the file-name index (names are stored back to back, ~1 byte per name char).
+const MAX_INDEX_BYTES: usize = 160 << 20;
+/// On-disk copy of the file-name index (binary, next to the folder-size cache).
+const FILES_FILE: &str = "file_names.idx";
+const FILES_MAGIC: &[u8; 8] = b"SXFNIDX1";
+/// The index file is rewritten at most this often (it can be tens of MB).
+const FILES_SAVE_GAP_SECS: u64 = 60;
+/// Parallel directory readers during a search. Reading a folder is a chain of syscalls (open,
+/// query, close, plus antivirus filters), so more readers than cores still help: while one waits
+/// in the kernel another runs. This is deliberately aggressive (like Explorer's search); lower
+/// `SEARCH_THREADS_MAX` or the multiplier to trade speed for CPU.
+const SEARCH_THREADS_MAX: usize = 24;
+fn search_threads() -> usize {
+    let cores = std::thread::available_parallelism().map(|n| n.get()).unwrap_or(4);
+    (cores * 3 / 2).clamp(6, SEARCH_THREADS_MAX)
+}
 
 #[derive(Clone, Serialize, Deserialize)]
 pub struct CachedFolder {
@@ -61,6 +91,7 @@ pub struct Indexer {
     cache_dirty: Arc<AtomicBool>,
     tx: Sender<IndexMsg>,
     ctx: egui::Context,
+    files: FileIndex,
 }
 
 fn now_secs() -> u64 {
@@ -78,6 +109,7 @@ impl Indexer {
             cache_dirty: Arc::new(AtomicBool::new(false)),
             tx,
             ctx,
+            files: FileIndex::new(),
         };
         me.load(dir);
         me
@@ -87,6 +119,11 @@ impl Indexer {
         self.cache.read().map(|c| c.len()).unwrap_or(0)
     }
 
+    /// Handle to the file-name index (cheap to clone, shareable with worker threads).
+    pub fn files(&self) -> FileIndex {
+        self.files.clone()
+    }
+
     /// Cached size regardless of age (shown immediately; fresh value follows).
     pub fn lookup(&self, path: &Path) -> Option<u64> {
         self.cache.read().ok()?.get(path).map(|c| c.size)
@@ -94,6 +131,7 @@ impl Indexer {
 
     /// Drop the path and every ancestor: their totals are no longer correct.
     pub fn invalidate(&self, path: &Path) {
+        self.files.invalidate(path);
         if let Ok(mut c) = self.cache.write() {
             let mut p = Some(path);
             while let Some(cur) = p {
@@ -107,19 +145,24 @@ impl Indexer {
     /// Forgets everything: stops a running scan, empties the cache and removes the saved file.
     pub fn delete_index(&self, dir: &Path) {
         self.generation.fetch_add(1, Ordering::SeqCst);
+        self.files.clear();
         if let Ok(mut c) = self.cache.write() {
             c.clear();
         }
         self.cache_dirty.store(false, Ordering::Relaxed);
         let _ = fs::remove_file(dir.join(INDEX_FILE));
         let _ = fs::remove_file(dir.join(format!("{INDEX_FILE}.tmp")));
+        let _ = fs::remove_file(dir.join(FILES_FILE));
+        let _ = fs::remove_file(dir.join(format!("{FILES_FILE}.tmp")));
+        self.files.dirty.store(false, Ordering::Relaxed);
     }
 
     pub fn is_dirty(&self) -> bool {
-        self.cache_dirty.load(Ordering::Relaxed)
+        self.cache_dirty.load(Ordering::Relaxed) || self.files.is_dirty()
     }
 
     pub fn clear(&self) {
+        self.files.clear();
         if let Ok(mut c) = self.cache.write() {
             c.clear();
         }
@@ -164,6 +207,7 @@ impl Indexer {
     // ---------------------------------------------------------------- persistence
 
     pub fn load(&self, dir: &Path) {
+        self.files.load_async(dir);
         let Ok(text) = fs::read_to_string(dir.join(INDEX_FILE)) else { return };
         let Ok(file) = serde_json::from_str::<IndexFile>(&text) else { return };
         if let Ok(mut c) = self.cache.write() {
@@ -173,6 +217,10 @@ impl Indexer {
 
     /// Saves in a background thread (write to temp file, then rename) if anything changed.
     pub fn save_if_dirty(&self, dir: &Path, wait: bool) {
+        if !wait {
+            // Never on the closing path: the name index can be big and closing must stay instant.
+            self.files.save(dir);
+        }
         if !self.cache_dirty.swap(false, Ordering::Relaxed) {
             return;
         }
@@ -306,7 +354,7 @@ fn scan(root: &Path, root_stamp: u128, cache: &Cache, generation: &AtomicU64, my
 }
 
 #[cfg(windows)]
-fn lower_priority() {
+pub fn lower_priority() {
     // THREAD_MODE_BACKGROUND_BEGIN lowers CPU *and* I/O priority of this thread.
     #[link(name = "kernel32")]
     extern "system" {
@@ -318,7 +366,505 @@ fn lower_priority() {
     }
 }
 #[cfg(not(windows))]
-fn lower_priority() {}
+pub fn lower_priority() {}
+
+/// Interactive work (a search the user is waiting for): slightly below the UI thread, but with
+/// normal I/O priority. (`lower_priority`'s background mode also drops I/O to "very low", which
+/// makes directory reads crawl and leaves the CPU almost idle.)
+#[cfg(windows)]
+pub fn below_normal_priority() {
+    #[link(name = "kernel32")]
+    extern "system" {
+        fn GetCurrentThread() -> isize;
+        fn SetThreadPriority(h: isize, p: i32) -> i32;
+    }
+    unsafe {
+        SetThreadPriority(GetCurrentThread(), -1); // THREAD_PRIORITY_BELOW_NORMAL
+    }
+}
+#[cfg(not(windows))]
+pub fn below_normal_priority() {}
+
+// ----------------------------------------------------------------------------------------------
+// File-name index: recursive search without hammering the disk
+
+const F_DIR: u8 = 1;
+const F_HIDDEN: u8 = 2;
+const F_LINK: u8 = 4;
+
+/// The direct children of one folder. `names` holds `<flag char><name>/` per child (`/` can't
+/// occur in a file name), so a million files cost roughly their name lengths in memory.
+struct DirRec {
+    stamp: u128,
+    scanned_at: AtomicU64,
+    names: Box<str>,
+}
+
+fn rec_cost(dir: &Path, rec: &DirRec) -> usize {
+    rec.names.len() + dir.as_os_str().len() + 96
+}
+
+fn read_rec(dir: &Path) -> Option<DirRec> {
+    // Stamp first: if the folder changes while we read, the next check simply rescans.
+    let stamp = fs::metadata(dir).and_then(|m| m.modified()).map(ns).unwrap_or(0);
+    let rd = fs::read_dir(dir).ok()?;
+    let mut names = String::new();
+    for item in rd.flatten() {
+        let Ok(ft) = item.file_type() else { continue };
+        let name = item.file_name().to_string_lossy().into_owned();
+        if name.contains('/') {
+            continue;
+        }
+        let hidden = match item.metadata() {
+            Ok(md) => crate::fsops::is_hidden_entry(&name, &md),
+            Err(_) => name.starts_with('.'),
+        };
+        let mut flags = 0u8;
+        if ft.is_dir() {
+            flags |= F_DIR;
+        }
+        if hidden {
+            flags |= F_HIDDEN;
+        }
+        if ft.is_symlink() {
+            flags |= F_LINK; // symlinks & junctions are listed but never entered
+        }
+        names.push((b'0' + flags) as char);
+        names.push_str(&name);
+        names.push('/');
+    }
+    names.shrink_to_fit();
+    Some(DirRec { stamp, scanned_at: AtomicU64::new(now_secs()), names: names.into_boxed_str() })
+}
+
+/// `(flags, name)` of every child.
+fn children(rec: &DirRec) -> impl Iterator<Item = (u8, &str)> {
+    rec.names.split('/').filter_map(|item| {
+        let b = *item.as_bytes().first()?;
+        Some((b.wrapping_sub(b'0'), &item[1..]))
+    })
+}
+
+/// Case-insensitive substring test; `q` must already be lower-case.
+fn name_matches(name: &str, q: &str) -> bool {
+    if q.is_empty() {
+        return true;
+    }
+    if name.is_ascii() && q.is_ascii() {
+        let (n, qb) = (name.as_bytes(), q.as_bytes());
+        return qb.len() <= n.len() && n.windows(qb.len()).any(|w| w.eq_ignore_ascii_case(qb));
+    }
+    name.to_lowercase().contains(q)
+}
+
+fn read_record(r: &mut impl std::io::Read) -> Option<(PathBuf, Arc<DirRec>)> {
+    fn u32_of(r: &mut impl std::io::Read) -> Option<u32> {
+        let mut b = [0u8; 4];
+        r.read_exact(&mut b).ok()?;
+        Some(u32::from_le_bytes(b))
+    }
+    let plen = u32_of(r)? as usize;
+    if plen == 0 || plen > 32 * 1024 {
+        return None;
+    }
+    let mut pb = vec![0u8; plen];
+    r.read_exact(&mut pb).ok()?;
+    let path = PathBuf::from(String::from_utf8(pb).ok()?);
+    let mut sb = [0u8; 16];
+    r.read_exact(&mut sb).ok()?;
+    let mut tb = [0u8; 8];
+    r.read_exact(&mut tb).ok()?;
+    let nlen = u32_of(r)? as usize;
+    if nlen > 256 << 20 {
+        return None;
+    }
+    let mut nb = vec![0u8; nlen];
+    r.read_exact(&mut nb).ok()?;
+    let names = String::from_utf8(nb).ok()?.into_boxed_str();
+    Some((
+        path,
+        Arc::new(DirRec {
+            stamp: u128::from_le_bytes(sb),
+            scanned_at: AtomicU64::new(u64::from_le_bytes(tb)),
+            names,
+        }),
+    ))
+}
+
+pub struct Hit {
+    pub path: PathBuf,
+    pub is_dir: bool,
+}
+
+pub enum SearchEnd {
+    /// Every reachable folder was visited.
+    Done,
+    /// The caller's `cancelled` returned true.
+    Cancelled,
+    /// `on_hit` asked to stop (result limit reached).
+    Stopped,
+}
+
+#[derive(Clone)]
+pub struct FileIndex {
+    dirs: Arc<RwLock<HashMap<PathBuf, Arc<DirRec>>>>,
+    bytes: Arc<AtomicUsize>,
+    dirty: Arc<AtomicBool>,
+    saving: Arc<AtomicBool>,
+    last_save: Arc<AtomicU64>,
+}
+
+impl FileIndex {
+    fn new() -> Self {
+        Self {
+            dirs: Arc::new(RwLock::new(HashMap::new())),
+            bytes: Arc::new(AtomicUsize::new(0)),
+            dirty: Arc::new(AtomicBool::new(false)),
+            saving: Arc::new(AtomicBool::new(false)),
+            last_save: Arc::new(AtomicU64::new(now_secs())),
+        }
+    }
+
+    pub fn clear(&self) {
+        if let Ok(mut m) = self.dirs.write() {
+            m.clear();
+        }
+        self.bytes.store(0, Ordering::Relaxed);
+        self.dirty.store(true, Ordering::Relaxed);
+    }
+
+    /// Something in `path` changed: its own listing and its parent's listing are stale.
+    /// (Deeper levels stay valid; vanished sub-folders are pruned when the parent is re-read.)
+    pub fn invalidate(&self, path: &Path) {
+        if let Ok(mut m) = self.dirs.write() {
+            for p in [Some(path), path.parent()].into_iter().flatten() {
+                if let Some(old) = m.remove(p) {
+                    self.bytes.fetch_sub(rec_cost(p, &old), Ordering::Relaxed);
+                    self.dirty.store(true, Ordering::Relaxed);
+                }
+            }
+        }
+    }
+
+    /// Called when a folder is opened: indexes that one level.
+    pub fn record_shallow(&self, dir: &Path) {
+        if let Some(rec) = read_rec(dir) {
+            self.store(dir.to_path_buf(), Arc::new(rec));
+        }
+    }
+
+    // ------------------------------------------------------------ persistence
+
+    pub fn is_dirty(&self) -> bool {
+        self.dirty.load(Ordering::Relaxed)
+    }
+
+    /// Reads the saved index in a background thread. Entries found live in the meantime win,
+    /// so a search that starts before loading has finished is never overwritten by old data.
+    pub fn load_async(&self, dir: &Path) {
+        let me = self.clone();
+        let path = dir.join(FILES_FILE);
+        std::thread::spawn(move || {
+            lower_priority();
+            me.load_from(&path);
+        });
+    }
+
+    fn load_from(&self, path: &Path) {
+        use std::io::Read;
+        let Ok(f) = fs::File::open(path) else { return };
+        let mut r = std::io::BufReader::with_capacity(1 << 20, f);
+        let mut magic = [0u8; 8];
+        if r.read_exact(&mut magic).is_err() || &magic != FILES_MAGIC {
+            return;
+        }
+        let mut batch: Vec<(PathBuf, Arc<DirRec>)> = Vec::new();
+        while let Some(item) = read_record(&mut r) {
+            batch.push(item);
+            if batch.len() >= 512 {
+                self.merge(&mut batch);
+                std::thread::sleep(Duration::from_millis(1));
+            }
+        }
+        self.merge(&mut batch);
+    }
+
+    fn merge(&self, batch: &mut Vec<(PathBuf, Arc<DirRec>)>) {
+        let Ok(mut m) = self.dirs.write() else {
+            batch.clear();
+            return;
+        };
+        for (p, r) in batch.drain(..) {
+            let cost = rec_cost(&p, &r);
+            if m.contains_key(&p) || self.bytes.load(Ordering::Relaxed) + cost > MAX_INDEX_BYTES {
+                continue;
+            }
+            self.bytes.fetch_add(cost, Ordering::Relaxed);
+            m.insert(p, r);
+        }
+    }
+
+    /// Writes the index (temp file, then rename) from a background thread when something changed,
+    /// at most once per `FILES_SAVE_GAP_SECS` and never two writers at once.
+    pub fn save(&self, dir: &Path) {
+        if !self.dirty.load(Ordering::Relaxed) {
+            return;
+        }
+        let now = now_secs();
+        if now.saturating_sub(self.last_save.load(Ordering::Relaxed)) < FILES_SAVE_GAP_SECS {
+            return;
+        }
+        if self.saving.swap(true, Ordering::SeqCst) {
+            return;
+        }
+        self.last_save.store(now, Ordering::Relaxed);
+        let me = self.clone();
+        let dir = dir.to_path_buf();
+        std::thread::spawn(move || {
+            lower_priority();
+            me.dirty.store(false, Ordering::Relaxed); // changes from here on mark it dirty again
+            let ok = me.write_to(&dir).is_some();
+            if !ok {
+                me.dirty.store(true, Ordering::Relaxed);
+            }
+            me.saving.store(false, Ordering::SeqCst);
+        });
+    }
+
+    fn write_to(&self, dir: &Path) -> Option<()> {
+        use std::io::Write;
+        let cutoff = now_secs().saturating_sub(PRUNE_SECS);
+        // Snapshot of Arcs only: the lock is held for a moment, the writing happens outside it.
+        let snapshot: Vec<(PathBuf, Arc<DirRec>)> = self
+            .dirs
+            .read()
+            .ok()?
+            .iter()
+            .filter(|(_, r)| r.scanned_at.load(Ordering::Relaxed) >= cutoff)
+            .map(|(k, v)| (k.clone(), Arc::clone(v)))
+            .collect();
+        fs::create_dir_all(dir).ok()?;
+        let tmp = dir.join(format!("{FILES_FILE}.tmp"));
+        let mut w = std::io::BufWriter::with_capacity(1 << 20, fs::File::create(&tmp).ok()?);
+        w.write_all(FILES_MAGIC).ok()?;
+        for (i, (path, rec)) in snapshot.iter().enumerate() {
+            let Some(p) = path.to_str() else { continue };
+            w.write_all(&(p.len() as u32).to_le_bytes()).ok()?;
+            w.write_all(p.as_bytes()).ok()?;
+            w.write_all(&rec.stamp.to_le_bytes()).ok()?;
+            w.write_all(&rec.scanned_at.load(Ordering::Relaxed).to_le_bytes()).ok()?;
+            w.write_all(&(rec.names.len() as u32).to_le_bytes()).ok()?;
+            w.write_all(rec.names.as_bytes()).ok()?;
+            if i % 2048 == 2047 {
+                std::thread::sleep(Duration::from_millis(1)); // keep the disk free for the UI
+            }
+        }
+        w.flush().ok()?;
+        drop(w);
+        fs::rename(&tmp, dir.join(FILES_FILE)).ok()
+    }
+
+    fn store(&self, dir: PathBuf, rec: Arc<DirRec>) {
+        let mut vanished: Vec<PathBuf> = Vec::new();
+        {
+            let Ok(mut m) = self.dirs.write() else { return };
+            if let Some(old) = m.get(&dir) {
+                // sub-folders that existed before but are gone now: their records are garbage
+                let now: HashSet<&str> =
+                    children(&rec).filter(|(f, _)| f & F_DIR != 0).map(|(_, n)| n).collect();
+                for (f, n) in children(old) {
+                    if f & F_DIR != 0 && f & F_LINK == 0 && !now.contains(n) {
+                        vanished.push(dir.join(n));
+                    }
+                }
+                self.bytes.fetch_sub(rec_cost(&dir, old), Ordering::Relaxed);
+            } else if self.bytes.load(Ordering::Relaxed) + rec_cost(&dir, &rec) > MAX_INDEX_BYTES {
+                return; // budget exhausted: searching still works, it just isn't remembered
+            }
+            self.bytes.fetch_add(rec_cost(&dir, &rec), Ordering::Relaxed);
+            m.insert(dir, rec);
+            self.dirty.store(true, Ordering::Relaxed);
+        }
+        for v in vanished {
+            self.forget_subtree(&v);
+        }
+    }
+
+    fn forget_subtree(&self, root: &Path) {
+        let mut stack = vec![root.to_path_buf()];
+        while let Some(p) = stack.pop() {
+            let old = match self.dirs.write() {
+                Ok(mut m) => m.remove(&p),
+                Err(_) => return,
+            };
+            if let Some(old) = old {
+                self.dirty.store(true, Ordering::Relaxed);
+                self.bytes.fetch_sub(rec_cost(&p, &old), Ordering::Relaxed);
+                for (f, n) in children(&old) {
+                    if f & F_DIR != 0 && f & F_LINK == 0 {
+                        stack.push(p.join(n));
+                    }
+                }
+            }
+        }
+    }
+
+    /// The stored listing if it can still be trusted: young, or the folder's mtime is unchanged
+    /// (a folder's mtime changes whenever a direct child is added, removed or renamed).
+    fn get_fresh(&self, dir: &Path) -> Option<Arc<DirRec>> {
+        let rec = self.dirs.read().ok()?.get(dir).cloned()?;
+        let now = now_secs();
+        if now.saturating_sub(rec.scanned_at.load(Ordering::Relaxed)) < FRESH_SECS {
+            return Some(rec);
+        }
+        let stamp = fs::metadata(dir).and_then(|m| m.modified()).map(ns).ok()?;
+        if stamp == rec.stamp {
+            rec.scanned_at.store(now, Ordering::Relaxed);
+            Some(rec)
+        } else {
+            None
+        }
+    }
+
+    /// Reads one folder (from the index or from disk, remembering it), sends matching children
+    /// to `tx` and collects the sub-folders still to visit.
+    fn visit(
+        &self,
+        dir: &Path,
+        root: &Path,
+        q: &str,
+        show_hidden: bool,
+        tx: &std::sync::mpsc::Sender<Hit>,
+        subdirs: &mut Vec<PathBuf>,
+    ) {
+        let rec = match self.get_fresh(dir) {
+            Some(r) => r,
+            None => match read_rec(dir) {
+                Some(r) => {
+                    let r = Arc::new(r);
+                    self.store(dir.to_path_buf(), Arc::clone(&r));
+                    r
+                }
+                None => {
+                    if dir != root {
+                        self.forget_subtree(dir); // deleted or no access
+                    }
+                    return;
+                }
+            },
+        };
+        for (flags, name) in children(&rec) {
+            if flags & F_HIDDEN != 0 && !show_hidden {
+                continue;
+            }
+            let is_dir = flags & F_DIR != 0;
+            if name_matches(name, q) && tx.send(Hit { path: dir.join(name), is_dir }).is_err() {
+                return; // the search was stopped
+            }
+            if is_dir && flags & F_LINK == 0 {
+                subdirs.push(dir.join(name));
+            }
+        }
+    }
+
+    /// Search below `root`, nearest folders first (roughly: several readers work through a
+    /// shared first-in-first-out queue). Known folders come from memory; unknown/stale ones are
+    /// read from disk by a few parallel readers and remembered. `query` is a case-insensitive
+    /// substring of the name. Hidden items are skipped unless `show_hidden`.
+    /// `cancelled` is polled ~30 times a second. `on_event` runs on the calling thread: with
+    /// `Some(hit)` for every match, and with `None` ~30 times a second while nothing arrives
+    /// (so the caller can push partial results out). Returning false stops the search.
+    pub fn search(
+        &self,
+        root: &Path,
+        query: &str,
+        show_hidden: bool,
+        cancelled: &dyn Fn() -> bool,
+        on_event: &mut dyn FnMut(Option<Hit>) -> bool,
+    ) -> SearchEnd {
+        use std::sync::{mpsc, Condvar};
+        let q = query.trim().to_lowercase();
+        let queue: Mutex<VecDeque<PathBuf>> = Mutex::new(VecDeque::from([root.to_path_buf()]));
+        let wake = Condvar::new();
+        let pending = AtomicUsize::new(1); // folders queued or being read
+        let waiting = AtomicUsize::new(0); // readers currently idle, waiting for work
+        let stop = AtomicBool::new(false);
+        let (tx, rx) = mpsc::channel::<Hit>();
+
+        std::thread::scope(|s| {
+            for _ in 0..search_threads() {
+                let tx = tx.clone();
+                let (queue, wake, pending, waiting, stop, q) =
+                    (&queue, &wake, &pending, &waiting, &stop, &q);
+                s.spawn(move || {
+                    below_normal_priority();
+                    loop {
+                        let dir = {
+                            let mut g = queue.lock().unwrap_or_else(|e| e.into_inner());
+                            loop {
+                                if stop.load(Ordering::Relaxed) {
+                                    return;
+                                }
+                                if let Some(d) = g.pop_front() {
+                                    break d;
+                                }
+                                if pending.load(Ordering::SeqCst) == 0 {
+                                    return; // nothing queued, nothing in flight: finished
+                                }
+                                waiting.fetch_add(1, Ordering::SeqCst);
+                                g = wake
+                                    .wait_timeout(g, Duration::from_millis(20))
+                                    .unwrap_or_else(|e| e.into_inner())
+                                    .0;
+                                waiting.fetch_sub(1, Ordering::SeqCst);
+                            }
+                        };
+                        let mut subdirs = Vec::new();
+                        self.visit(&dir, root, q, show_hidden, &tx, &mut subdirs);
+                        let n_new = subdirs.len();
+                        if !subdirs.is_empty() {
+                            pending.fetch_add(subdirs.len(), Ordering::SeqCst);
+                            queue.lock().unwrap_or_else(|e| e.into_inner()).extend(subdirs);
+                        }
+                        let left = pending.fetch_sub(1, Ordering::SeqCst) - 1;
+                        // Wake idle readers only when it matters (new work, or all done); waking
+                        // everyone after every folder made the readers fight over the queue.
+                        if waiting.load(Ordering::SeqCst) > 0 && (n_new > 0 || left == 0) {
+                            wake.notify_all();
+                        }
+                    }
+                });
+            }
+            drop(tx); // the readers hold the only senders: when they all end, recv disconnects
+
+            let mut end = SearchEnd::Done;
+            loop {
+                if cancelled() {
+                    end = SearchEnd::Cancelled;
+                    break;
+                }
+                match rx.recv_timeout(Duration::from_millis(30)) {
+                    Ok(hit) => {
+                        if !on_event(Some(hit)) {
+                            end = SearchEnd::Stopped;
+                            break;
+                        }
+                    }
+                    Err(mpsc::RecvTimeoutError::Timeout) => {
+                        if !on_event(None) {
+                            end = SearchEnd::Stopped;
+                            break;
+                        }
+                    }
+                    Err(mpsc::RecvTimeoutError::Disconnected) => break,
+                }
+            }
+            stop.store(true, Ordering::Relaxed);
+            wake.notify_all();
+            end
+        })
+    }
+}
 
 // ----------------------------------------------------------------------------------------------
 // File watcher: live refresh + cache invalidation

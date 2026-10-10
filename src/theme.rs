@@ -367,7 +367,7 @@ fn visuals(p: &Palette, m: &Metrics) -> Visuals {
     v.selection.bg_fill = with_alpha(p.accent, 0.40);
     v.selection.stroke = Stroke::new(1.0_f32, p.accent);
     v.hyperlink_color = p.accent;
-    v.override_text_color = Some(p.text_disabled);
+    v.override_text_color = None;
 
     let w = &mut v.widgets;
     w.noninteractive.bg_fill = Color32::TRANSPARENT;

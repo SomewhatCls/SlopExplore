@@ -34,6 +34,13 @@ use std::{
 use sysinfo::Disks;
 use theme::*;
 
+/// Sub-folder search: shortest query that walks sub-folders, typing pause before a walk starts,
+/// how often partial results are pushed to the UI, and the most matches kept.
+const DEEP_MIN_CHARS: usize = 2;
+const DEEP_DEBOUNCE: Duration = Duration::from_millis(220);
+const DEEP_FLUSH: Duration = Duration::from_millis(120);
+const DEEP_MAX_HITS: usize = 5000;
+
 // ==============================================================================================
 // Data
 
@@ -50,6 +57,9 @@ struct Entry {
     type_text: String,
     icon: &'static str,
     dir_size: Option<u64>,
+    /// Search hits from sub-folders: the folder they live in, relative to the searched folder.
+    /// Empty for the folder's own items.
+    rel: String,
 }
 
 impl Entry {
@@ -155,6 +165,18 @@ struct Tab {
     rename: Option<RenameState>,
     pending_rename: Option<PathBuf>,
     trash: Option<TrashState>,
+    /// `entries[..n_local]` is the folder's own listing; anything after it is a search match
+    /// from a sub-folder.
+    n_local: usize,
+    /// The (lower-case) query the sub-folder search was started for.
+    deep_query: String,
+    /// The query as last typed and when it changed (debounce).
+    deep_seen: (String, Instant),
+    deep_running: bool,
+    deep_truncated: bool,
+    deep_gen: u64,
+    /// Workers hold a Weak to this: they stop when it changes or when the tab is gone.
+    deep_token: Arc<AtomicU64>,
 }
 
 impl Tab {
@@ -183,7 +205,59 @@ impl Tab {
             rename: None,
             pending_rename: None,
             trash: None,
+            n_local: 0,
+            deep_query: String::new(),
+            deep_seen: (String::new(), Instant::now()),
+            deep_running: false,
+            deep_truncated: false,
+            deep_gen: 0,
+            deep_token: Arc::new(AtomicU64::new(0)),
         }
+    }
+
+    /// Stops a running sub-folder search (its worker notices within one directory).
+    fn cancel_deep(&mut self) {
+        self.deep_gen += 1;
+        self.deep_token.store(self.deep_gen, AO::SeqCst);
+        self.deep_running = false;
+        self.deep_truncated = false;
+    }
+
+    /// Removes specific sub-folder matches (they no longer exist).
+    fn forget_deep(&mut self, gone: &HashSet<PathBuf>) {
+        let (n_local, mut i) = (self.n_local, 0usize);
+        let before = self.entries.len();
+        self.entries.retain(|e| {
+            let keep = i < n_local || !gone.contains(&e.path);
+            i += 1;
+            keep
+        });
+        if self.entries.len() != before {
+            self.lookup = self
+                .entries
+                .iter()
+                .enumerate()
+                .map(|(i, e)| (e.path.clone(), i))
+                .collect();
+            self.selected.retain(|p| !gone.contains(p));
+            self.view_dirty = true;
+        }
+    }
+
+    /// Removes the sub-folder matches again, leaving only the folder's own listing.
+    fn drop_deep(&mut self) {
+        let keep = self.n_local.min(self.entries.len());
+        if self.entries.len() == keep {
+            return;
+        }
+        for e in self.entries.drain(keep..) {
+            self.lookup.remove(&e.path);
+            self.selected.remove(&e.path);
+        }
+        if self.anchor.as_ref().is_some_and(|a| !self.lookup.contains_key(a)) {
+            self.anchor = None;
+        }
+        self.view_dirty = true;
     }
 
     fn select_only(&mut self, p: PathBuf) {
@@ -516,6 +590,14 @@ enum AppMsg {
         result: Result<Vec<Entry>, String>,
     },
     Drives(Vec<DriveInfo>),
+    /// A batch of matches from a sub-folder search. `done` = finished (and whether the hit
+    /// limit cut it short).
+    Search {
+        tab: u64,
+        seq: u64,
+        hits: Vec<Entry>,
+        done: Option<bool>,
+    },
     Job(Result<String, String>),
     Stats(u64, FolderStats),
     Trash {
@@ -597,6 +679,45 @@ impl Debounce {
 // ==============================================================================================
 // Listing
 
+/// Builds a list row from an item's own (non-followed) metadata.
+fn make_entry(path: PathBuf, name: String, md: &fs::Metadata, fmt: DateFormat) -> Entry {
+    let is_link = md.file_type().is_symlink();
+    let target = if is_link {
+        fs::metadata(&path).ok()
+    } else {
+        None
+    };
+    let eff = target.as_ref().unwrap_or(md);
+    let is_dir = eff.is_dir();
+    let modified = eff.modified().ok().or_else(|| md.modified().ok());
+    let ext = path
+        .extension()
+        .and_then(|e| e.to_str())
+        .map(|e| e.to_lowercase());
+    let (type_text, icon) = if is_dir {
+        ("File folder".to_owned(), "folder")
+    } else {
+        match &ext {
+            Some(e) => (format!("{} file", e.to_uppercase()), icon_for_extension(e)),
+            None => ("File".to_owned(), "file"),
+        }
+    };
+    Entry {
+        name_lc: name.to_lowercase(),
+        name,
+        path,
+        is_dir,
+        is_link,
+        size: if is_dir { 0 } else { eff.len() },
+        modified,
+        date_text: format_date(modified, fmt, false),
+        type_text,
+        icon,
+        dir_size: None,
+        rel: String::new(),
+    }
+}
+
 fn read_listing(dir: &Path, show_hidden: bool, fmt: DateFormat) -> Result<Vec<Entry>, String> {
     let rd = fs::read_dir(dir).map_err(|e| format!("Could not read this folder: {e}"))?;
     let mut out = Vec::with_capacity(256);
@@ -607,41 +728,7 @@ fn read_listing(dir: &Path, show_hidden: bool, fmt: DateFormat) -> Result<Vec<En
         if !show_hidden && is_hidden_entry(&name, &md) {
             continue;
         }
-        let path = item.path();
-        let is_link = md.file_type().is_symlink();
-        let target = if is_link {
-            fs::metadata(&path).ok()
-        } else {
-            None
-        };
-        let eff = target.as_ref().unwrap_or(&md);
-        let is_dir = eff.is_dir();
-        let modified = eff.modified().ok().or_else(|| md.modified().ok());
-        let ext = path
-            .extension()
-            .and_then(|e| e.to_str())
-            .map(|e| e.to_lowercase());
-        let (type_text, icon) = if is_dir {
-            ("File folder".to_owned(), "folder")
-        } else {
-            match &ext {
-                Some(e) => (format!("{} file", e.to_uppercase()), icon_for_extension(e)),
-                None => ("File".to_owned(), "file"),
-            }
-        };
-        out.push(Entry {
-            name_lc: name.to_lowercase(),
-            name,
-            path,
-            is_dir,
-            is_link,
-            size: if is_dir { 0 } else { eff.len() },
-            modified,
-            date_text: format_date(modified, fmt, false),
-            type_text,
-            icon,
-            dir_size: None,
-        });
+        out.push(make_entry(item.path(), name, &md, fmt));
     }
     Ok(out)
 }
@@ -932,14 +1019,20 @@ impl Explorer {
         tab.error = None;
         let (id, seq, dir) = (tab.id, tab.load_gen, tab.dir.clone());
         let (tx, ctx) = (self.msg_tx.clone(), self.ctx.clone());
+        let files = self.indexer.files();
         std::thread::spawn(move || {
             let result = read_listing(&dir, show_hidden, fmt);
+            let ok = result.is_ok();
             let _ = tx.send(AppMsg::Listing {
                 tab: id,
                 seq,
                 result,
             });
             ctx.request_repaint();
+            if ok {
+                // Opening a folder remembers its file names (one level) for later searches.
+                files.record_shallow(&dir);
+            }
         });
     }
 
@@ -1049,6 +1142,9 @@ impl Explorer {
         tab.rename = None;
         tab.editing_addr = false;
         tab.trash = None;
+        tab.cancel_deep();
+        tab.n_local = 0;
+        tab.deep_query.clear();
         tab.entries.clear();
         tab.lookup.clear();
         tab.view.clear();
@@ -1094,7 +1190,8 @@ impl Explorer {
             tab.id.hash(&mut h);
             tab.dir.hash(&mut h);
             acc ^= h.finish();
-            for e in tab.entries.iter_mut().filter(|e| e.is_dir && !e.is_link) {
+            let n = tab.n_local.min(tab.entries.len());
+            for e in tab.entries[..n].iter_mut().filter(|e| e.is_dir && !e.is_link) {
                 if e.dir_size.is_none() {
                     e.dir_size = self.indexer.lookup(&e.path);
                 }
@@ -1400,6 +1497,33 @@ impl Explorer {
 
         while let Ok(msg) = self.msg_rx.try_recv() {
             match msg {
+                AppMsg::Search { tab, seq, hits, done } => {
+                    if let Some(t) = self
+                        .tabs
+                        .iter_mut()
+                        .find(|t| t.id == tab && t.deep_gen == seq)
+                    {
+                        let mut added = false;
+                        for mut e in hits {
+                            if t.lookup.contains_key(&e.path) {
+                                continue; // the folder's own item, or an earlier batch
+                            }
+                            if e.is_dir && !e.is_link {
+                                e.dir_size = self.indexer.lookup(&e.path);
+                            }
+                            t.lookup.insert(e.path.clone(), t.entries.len());
+                            t.entries.push(e);
+                            added = true;
+                        }
+                        if added {
+                            t.view_dirty = true;
+                        }
+                        if let Some(truncated) = done {
+                            t.deep_running = false;
+                            t.deep_truncated = truncated;
+                        }
+                    }
+                }
                 AppMsg::Listing { tab, seq, result } => {
                     if let Some(t) = self
                         .tabs
@@ -1417,7 +1541,21 @@ impl Explorer {
                                     .enumerate()
                                     .map(|(i, e)| (e.path.clone(), i))
                                     .collect();
+                                // Sub-folder matches (and the walk producing them) survive a reload:
+                                // unrelated file-system churn must not restart a search.
+                                let deep: Vec<Entry> = if t.n_local <= t.entries.len() {
+                                    t.entries.split_off(t.n_local)
+                                } else {
+                                    Vec::new()
+                                };
+                                t.n_local = entries.len();
                                 t.entries = entries;
+                                for e in deep {
+                                    if !t.lookup.contains_key(&e.path) {
+                                        t.lookup.insert(e.path.clone(), t.entries.len());
+                                        t.entries.push(e);
+                                    }
+                                }
                                 t.view_dirty = true;
                                 if let Some(p) = t.pending_rename.take() {
                                     if let Some(&i) = t.lookup.get(&p) {
@@ -1441,6 +1579,9 @@ impl Explorer {
                                 rebuild_view(t);
                             }
                             Err(e) => {
+                                t.cancel_deep();
+                                t.deep_query.clear();
+                                t.n_local = 0;
                                 t.entries.clear();
                                 t.lookup.clear();
                                 t.view.clear();
@@ -1530,6 +1671,8 @@ impl Explorer {
         let changed = self.watcher.as_ref().map(|w| w.take()).unwrap_or_default();
         if !changed.is_empty() {
             let dir = self.tabs[self.active].dir.clone();
+            let searching = !self.tabs[self.active].search.trim().is_empty();
+            let mut gone: HashSet<PathBuf> = HashSet::new();
             for p in changed {
                 if p.as_os_str().is_empty() {
                     // Too many changes to list: refresh everything.
@@ -1545,7 +1688,16 @@ impl Explorer {
                     self.list_debounce.poke();
                 } else if p.starts_with(&dir) {
                     self.size_debounce.poke();
+                    if searching {
+                        let t = &self.tabs[self.active];
+                        if t.lookup.get(&p).is_some_and(|&i| i >= t.n_local) && !p.exists() {
+                            gone.insert(p.clone()); // a sub-folder match was deleted/moved
+                        }
+                    }
                 }
+            }
+            if !gone.is_empty() {
+                self.tabs[self.active].forget_deep(&gone);
             }
         }
 
@@ -1594,6 +1746,100 @@ impl Explorer {
                 self.ctx.request_repaint_after(Duration::from_secs(16));
             }
         }
+    }
+
+    // ------------------------------------------------------------------ sub-folder search
+
+    /// Keeps every visible tab's sub-folder search in step with its search box: waits until
+    /// typing pauses, then (re)starts a background walk; clearing the box cancels it.
+    fn drive_searches(&mut self) {
+        let mut start: Vec<(usize, String)> = Vec::new();
+        let mut waiting = false;
+        for ti in self.visible_tabs() {
+            let tab = &mut self.tabs[ti];
+            if tab.trash.is_some() {
+                continue;
+            }
+            let q = tab.search.trim().to_lowercase();
+            if q == tab.deep_query {
+                continue;
+            }
+            if q.chars().count() < DEEP_MIN_CHARS {
+                // empty or a single character: only the current level, no deep walk
+                tab.cancel_deep();
+                tab.drop_deep();
+                tab.deep_query = q;
+                continue;
+            }
+            if tab.deep_seen.0 != q {
+                tab.deep_seen = (q.clone(), Instant::now());
+            }
+            if tab.deep_seen.1.elapsed() >= DEEP_DEBOUNCE {
+                start.push((ti, q));
+            } else {
+                waiting = true;
+            }
+        }
+        if waiting {
+            self.ctx.request_repaint_after(Duration::from_millis(60));
+        }
+        for (ti, q) in start {
+            self.start_deep_search(ti, q);
+        }
+    }
+
+    fn start_deep_search(&mut self, ti: usize, q: String) {
+        let (show_hidden, fmt) = (self.settings.show_hidden, self.settings.date_format);
+        let files = self.indexer.files();
+        let (tx, ctx) = (self.msg_tx.clone(), self.ctx.clone());
+        let tab = &mut self.tabs[ti];
+        tab.cancel_deep(); // stops the previous walk and gives this one a fresh sequence number
+        tab.deep_running = true;
+        tab.deep_query = q.clone();
+        let (id, seq, root) = (tab.id, tab.deep_gen, tab.dir.clone());
+        let token = Arc::downgrade(&tab.deep_token);
+        std::thread::spawn(move || {
+            below_normal_priority();
+            let alive = || token.upgrade().is_some_and(|t| t.load(AO::Relaxed) == seq);
+            let send = |hits: Vec<Entry>, done: Option<bool>| {
+                let _ = tx.send(AppMsg::Search { tab: id, seq, hits, done });
+                ctx.request_repaint();
+            };
+            let mut batch: Vec<Entry> = Vec::new();
+            let mut total = 0usize;
+            let mut last = Instant::now();
+            let end = files.search(&root, &q, show_hidden, &alive, &mut |ev: Option<indexer::Hit>| {
+                if let Some(hit) = ev {
+                  if let Ok(md) = fs::symlink_metadata(&hit.path) {
+                    let name = hit
+                        .path
+                        .file_name()
+                        .map(|n| n.to_string_lossy().into_owned())
+                        .unwrap_or_default();
+                    let rel = hit
+                        .path
+                        .parent()
+                        .and_then(|p| p.strip_prefix(&root).ok())
+                        .map(|p| p.display().to_string())
+                        .unwrap_or_default();
+                    let mut e = make_entry(hit.path, name, &md, fmt);
+                    e.rel = rel;
+                    batch.push(e);
+                    total += 1;
+                  }
+                }
+                if batch.len() >= 200 || (!batch.is_empty() && last.elapsed() > DEEP_FLUSH) {
+                    send(std::mem::take(&mut batch), None);
+                    last = Instant::now();
+                }
+                total < DEEP_MAX_HITS && alive()
+            });
+            match end {
+                indexer::SearchEnd::Cancelled => {}
+                indexer::SearchEnd::Done => send(batch, Some(false)),
+                indexer::SearchEnd::Stopped => send(batch, Some(total >= DEEP_MAX_HITS)),
+            }
+        });
     }
 
     // ------------------------------------------------------------------ system integration
@@ -3602,6 +3848,7 @@ fn table_ui(
         error,
         loading,
         search,
+        deep_running,
         ..
     } = tab;
     let tab_id = *tab_id;
@@ -3817,7 +4064,11 @@ fn table_ui(
         let msg = if *loading {
             "Loading…"
         } else if !search.trim().is_empty() {
-            "No items match your search"
+            if *deep_running {
+                "Searching subfolders…"
+            } else {
+                "No items match your search"
+            }
         } else {
             "This folder is empty"
         };
@@ -3959,10 +4210,29 @@ fn table_ui(
                         text_col,
                         false,
                     );
+                    if !e.rel.is_empty() {
+                        // where the match lives, dimmed, right-aligned after the name
+                        let tw = text_width(ui, &e.name, m.font);
+                        let free = name_rect.width() - tw - m.pad * 1.5;
+                        if free > m.font * 4.0 {
+                            let rr = Rect::from_min_max(
+                                pos2(name_rect.left() + tw + m.pad, name_rect.top()),
+                                name_rect.right_bottom(),
+                            );
+                            paint_text(
+                                ui,
+                                rr,
+                                &e.rel,
+                                FontId::proportional(m.font * 0.9),
+                                pal.text_disabled,
+                                true,
+                            );
+                        }
+                    }
                 }
 
                 let size_text = if e.is_dir {
-                    match (e.dir_size, e.is_link) {
+                    match (e.dir_size, e.is_link || !e.rel.is_empty()) {
                         (Some(s), _) => format_size(s),
                         (None, true) => "—".to_owned(),
                         (None, false) => "Calculating…".to_owned(),
@@ -4830,8 +5100,17 @@ impl Explorer {
                 }
             }
         }
-        let busy =
-            self.jobs_running > 0 || tab.loading || tab.trash.as_ref().is_some_and(|t| t.loading);
+        if tab.trash.is_none() && !tab.search.trim().is_empty() {
+            if tab.deep_running {
+                text.push_str("   |   Searching subfolders…");
+            } else if tab.deep_truncated {
+                text.push_str(&format!("   |   Showing the first {DEEP_MAX_HITS} subfolder matches"));
+            }
+        }
+        let busy = self.jobs_running > 0
+            || tab.loading
+            || tab.deep_running
+            || tab.trash.as_ref().is_some_and(|t| t.loading);
         let job = self.job_label.clone();
         let clip = self.clipboard.as_ref().map(|(p, cut)| {
             let what = if p.len() == 1 {
@@ -5730,6 +6009,7 @@ impl eframe::App for Explorer {
         self.track_window(ctx);
         handle_resize(ctx, &self.m);
         self.pump_messages();
+        self.drive_searches();
         let rect = ctx.screen_rect();
         let painter = ctx.layer_painter(egui::LayerId::background());
 
