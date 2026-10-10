@@ -26,3 +26,6 @@ raw-window-handle = "0.6"
 [build-dependencies]
 winres = "0.1"
 
+[package.metadata.appimage]
+icon = "assets/logo.png"
+desktop_entry = "other/SlopExplore.desktop"
