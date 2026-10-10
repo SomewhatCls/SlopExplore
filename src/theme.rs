@@ -215,15 +215,15 @@ impl Palette {
         if dark {
             Self {
                 dark, mica, accent: acc, on_accent,
-                base: Color32::from_rgb(45, 45, 45),
-                layer: if mica { Color32::from_rgba_unmultiplied(80, 80, 80, 10) } else { Color32::from_rgb(0x28, 0x28, 0x28) },
+                base: Color32::from_rgb(60, 60, 60),
+                layer: if mica { Color32::from_rgba_unmultiplied(60, 60, 60, 180) } else { Color32::from_rgb(0x28, 0x28, 0x28) },
                 flyout: Color32::from_rgb(60, 60, 60),
                 text: Color32::WHITE,
                 text_secondary: a(255, 0.785),
                 text_disabled: a(255, 0.36),
                 subtle_hover: a(255, 0.10),
                 subtle_pressed: a(255, 0.065),
-                control: a(40, 0.1),
+                control: a(80, 0.2),
                 control_hover: a(255, 0.13),
                 control_stroke: a(190, 0.25),
                 divider: a(255, 0.15),
@@ -347,7 +347,7 @@ pub fn popup_shadow(dark: bool) -> egui::Shadow {
         offset: [0, 8],
         blur: 64,
         spread: 0,
-        color: Color32::from_black_alpha(if dark { 16 } else { 42 }),
+        color: Color32::from_black_alpha(if dark { 68 } else { 42 }),
     }
 }
 
