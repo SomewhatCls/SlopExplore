@@ -4389,7 +4389,7 @@ impl Explorer {
                             } else {
                                 // Resting tabs get a very faint plate; hovering strengthens it.
                                 let c = if resp.hovered() {
-                                    pal.control_hover
+                                    pal.subtle_hover
                                 } else {
                                     pal.subtle_pressed
                                 };
