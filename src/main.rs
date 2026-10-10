@@ -678,7 +678,7 @@ fn rebuild_view(tab: &mut Tab) {
 }
 
 fn load_drives() -> Vec<DriveInfo> {
-    Disks::new_with_refreshed_list()
+    let mut drives: Vec<DriveInfo> = Disks::new_with_refreshed_list()
         .list()
         .iter()
         .map(|d| DriveInfo {
@@ -687,7 +687,10 @@ fn load_drives() -> Vec<DriveInfo> {
             total: d.total_space(),
             available: d.available_space(),
         })
-        .collect()
+        .collect();
+        //sort drives by drive letter
+        drives.sort_by(|a, b| a.mount_point.cmp(&b.mount_point));
+        drives
 }
 
 fn expand_env(s: &str) -> String {

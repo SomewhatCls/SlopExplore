@@ -215,18 +215,18 @@ impl Palette {
         if dark {
             Self {
                 dark, mica, accent: acc, on_accent,
-                base: Color32::from_rgb(0x20, 0x20, 0x20),
-                layer: if mica { a(0x3A, 0.30) } else { Color32::from_rgb(0x28, 0x28, 0x28) },
-                flyout: Color32::from_rgb(0x2C, 0x2C, 0x2C),
+                base: Color32::from_rgb(45, 45, 45),
+                layer: if mica { Color32::from_rgba_unmultiplied(80, 80, 80, 10) } else { Color32::from_rgb(0x28, 0x28, 0x28) },
+                flyout: Color32::from_rgb(60, 60, 60),
                 text: Color32::WHITE,
                 text_secondary: a(255, 0.785),
                 text_disabled: a(255, 0.36),
                 subtle_hover: a(255, 0.10),
                 subtle_pressed: a(255, 0.065),
-                control: a(140, 0.06),
+                control: a(40, 0.1),
                 control_hover: a(255, 0.13),
-                control_stroke: a(190, 0.07),
-                divider: a(255, 0.0835),
+                control_stroke: a(190, 0.25),
+                divider: a(255, 0.15),
                 selected: with_alpha(acc, 0.075),
                 selected_hover: with_alpha(acc, 0.09),
                 hover: with_alpha(acc, 0.06),
@@ -246,7 +246,7 @@ impl Palette {
                 subtle_pressed: a(0, 0.05),
                 control: a(215, 0.5),
                 control_hover: a(0xF9, 0.50),
-                control_stroke: a(0, 0.0578),
+                control_stroke: a(0, 0.06),
                 divider: a(0, 0.15),
                 selected: with_alpha(acc, 0.12),
                 selected_hover: with_alpha(acc, 0.15),
@@ -347,7 +347,7 @@ pub fn popup_shadow(dark: bool) -> egui::Shadow {
         offset: [0, 8],
         blur: 64,
         spread: 0,
-        color: Color32::from_black_alpha(if dark { 115 } else { 42 }),
+        color: Color32::from_black_alpha(if dark { 16 } else { 42 }),
     }
 }
 
@@ -367,7 +367,7 @@ fn visuals(p: &Palette, m: &Metrics) -> Visuals {
     v.selection.bg_fill = with_alpha(p.accent, 0.40);
     v.selection.stroke = Stroke::new(1.0_f32, p.accent);
     v.hyperlink_color = p.accent;
-    v.override_text_color = Some(p.text);
+    v.override_text_color = Some(p.text_disabled);
 
     let w = &mut v.widgets;
     w.noninteractive.bg_fill = Color32::TRANSPARENT;
